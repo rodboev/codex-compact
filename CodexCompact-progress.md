@@ -5,7 +5,7 @@
 - [x] Build the release executable.
 - [x] Package the executable separately and verify startup and 65 migration checksums.
 - [x] Verify that the builder reuses the new package without changing the default launcher.
-- [x] Prepare the executable at file:///C:/Users/Rod/.codex/packages/standalone/custom/0.153.4-x86_64-pc-windows-msvc-compact/bin/codex.exe 
+- [x] Prepare the executable at ~/.codex/packages/standalone/custom/0.153.4-x86_64-pc-windows-msvc-compact/bin/codex.exe 
 - [x] Rod approves the trial output.
 
 - [x] Activate compact through the launcher junction and verify PATH resolution and executable checksum.
