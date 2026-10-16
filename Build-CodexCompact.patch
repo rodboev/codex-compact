@@ -188,7 +188,7 @@ index b34523e..89bad4d 100644
              .native_history
              .pending
 diff --git a/codex-rs/tui/src/app/owned_transcript.rs b/codex-rs/tui/src/app/owned_transcript.rs
-index 3fcd0cd..c13a803 100644
+index 3fcd0cd..4401469 100644
 --- a/codex-rs/tui/src/app/owned_transcript.rs
 +++ b/codex-rs/tui/src/app/owned_transcript.rs
 @@ -52,6 +52,7 @@ impl App {
@@ -199,7 +199,7 @@ index 3fcd0cd..c13a803 100644
          let active_ids = chat_widget.active_activity_ids();
          let expanded = view.sync_live_activity(&self.transcript_cells, active_ids)
              && chat_widget.history_render_mode() == HistoryRenderMode::Rich;
-@@ -63,9 +64,13 @@ impl App {
+@@ -63,9 +64,15 @@ impl App {
                  chat_widget.active_cell_transcript_hyperlink_lines(width)
              })
          } else {
@@ -211,7 +211,9 @@ index 3fcd0cd..c13a803 100644
 +                transcript_width,
 +                active_key,
 +                expanded,
-+                |width| chat_widget.active_cell_owned_transcript_lines(width, expanded),
++                |width, members| {
++                    chat_widget.active_cell_owned_transcript_lines(width, expanded, members)
++                },
 +            )
          };
          changed || search_changed
@@ -1429,7 +1431,7 @@ index d1cf18a..d7bb656 100644
 +    Ok(())
 +}
 diff --git a/codex-rs/tui/src/app_backtrack.rs b/codex-rs/tui/src/app_backtrack.rs
-index f55b75c..f4199ac 100644
+index f55b75c..d1b6514 100644
 --- a/codex-rs/tui/src/app_backtrack.rs
 +++ b/codex-rs/tui/src/app_backtrack.rs
 @@ -165,14 +165,27 @@ impl App {
@@ -1467,6 +1469,19 @@ index f55b75c..f4199ac 100644
          if self.scrollback_has_older_history
              && let Some(Overlay::Transcript(overlay)) = self.overlay.as_mut()
          {
+@@ -380,7 +393,11 @@ impl App {
+                     chat_widget.active_cell_transcript_hyperlink_lines(width)
+                 } else {
+                     chat_widget
+-                        .active_cell_owned_transcript_lines(width, /*expanded*/ false)
++                        .active_cell_owned_transcript_lines(
++                            width,
++                            /*expanded*/ false,
++                            &Default::default(),
++                        )
+                         .map(|mut lines| {
+                             lines.activity.extend(lines.auxiliary);
+                             lines.activity
 diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
 index 4c6ede3..0b1b7b8 100644
 --- a/codex-rs/tui/src/app_event.rs
@@ -1557,7 +1572,7 @@ index 232d6c0..c141ffe 100644
          &mut self,
          cell: Box<dyn HistoryCell>,
 diff --git a/codex-rs/tui/src/chatwidget/activity_presentation.rs b/codex-rs/tui/src/chatwidget/activity_presentation.rs
-index 573a477..f47f580 100644
+index 573a477..6887f79 100644
 --- a/codex-rs/tui/src/chatwidget/activity_presentation.rs
 +++ b/codex-rs/tui/src/chatwidget/activity_presentation.rs
 @@ -5,6 +5,14 @@ use super::*;
@@ -1575,7 +1590,11 @@ index 573a477..f47f580 100644
      pub(crate) fn active_activity_ids(&self) -> Vec<String> {
          self.transcript
              .active_cell
-@@ -20,6 +28,7 @@ impl ChatWidget {
+@@ -17,9 +25,11 @@ impl ChatWidget {
+         &self,
+         width: u16,
+         expanded: bool,
++        expanded_members: &std::collections::HashSet<String>,
      ) -> Option<ActivityTranscriptLines> {
          let active = self.transcript.active_cell.as_deref();
          let mode = self.history_render_mode();
@@ -1583,9 +1602,14 @@ index 573a477..f47f580 100644
          let render_compact = |cell: &dyn HistoryCell, width| {
              if cell.as_any().is::<history_cell::SessionInfoCell>() {
                  history_cell::fullscreen_session_lines(cell, width, /*detailed*/ false, mode)
-@@ -34,6 +43,11 @@ impl ChatWidget {
+@@ -32,12 +42,31 @@ impl ChatWidget {
+         let has_activity = mode == HistoryRenderMode::Rich
+             && active.is_some_and(|cell| !cell.activity_ids().is_empty());
          let activity = active.map_or_else(Vec::new, |cell| {
-             if expanded && has_activity {
+-            if expanded && has_activity {
++            if summary.is_some() && expanded {
++                Vec::new()
++            } else if expanded && has_activity {
                  cell.expanded_hyperlink_lines(width)
 +            } else if summary.is_some() {
 +                cell.running_activity_lines(width)
@@ -1595,7 +1619,23 @@ index 573a477..f47f580 100644
              } else {
                  render_compact(cell, width)
              }
-@@ -50,7 +64,7 @@ impl ChatWidget {
+         });
++        let members = active
++            .filter(|_| summary.is_some() && expanded)
++            .map_or_else(Vec::new, |cell| {
++                cell.activity_member_ids()
++                    .into_iter()
++                    .map(|ids| {
++                        let expanded = ids.iter().any(|id| expanded_members.contains(id));
++                        let lines = cell.activity_member_lines(width, &ids, expanded);
++                        crate::transcript_view::ActivityMember { ids, lines }
++                    })
++                    .collect()
++            });
+         let disclosure = active
+             .filter(|_| has_activity)
+             .and_then(|cell| cell.activity_disclosure(width));
+@@ -50,15 +79,16 @@ impl ChatWidget {
                  }
              })
              .unwrap_or_default();
@@ -1603,7 +1643,17 @@ index 573a477..f47f580 100644
 +        if activity.is_empty() && auxiliary.is_empty() && summary.is_none() {
              return None;
          }
-         if !activity.is_empty() && !auxiliary.is_empty() {
+-        if !activity.is_empty() && !auxiliary.is_empty() {
++        if (!activity.is_empty() || !members.is_empty()) && !auxiliary.is_empty() {
+             auxiliary.insert(/*index*/ 0, HyperlinkLine::from(""));
+         }
+         Some(ActivityTranscriptLines {
+             activity,
+             auxiliary,
++            members,
+             disclosure,
+         })
+     }
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
 index 85ea551..b07502c 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
@@ -1758,6 +1808,93 @@ index 1907577..ce8fc6e 100644
                  }
              }
              item => {
+diff --git a/codex-rs/tui/src/chatwidget/tests/tool_activity_tests.rs b/codex-rs/tui/src/chatwidget/tests/tool_activity_tests.rs
+index 4638d46..384d69f 100644
+--- a/codex-rs/tui/src/chatwidget/tests/tool_activity_tests.rs
++++ b/codex-rs/tui/src/chatwidget/tests/tool_activity_tests.rs
+@@ -32,3 +32,82 @@ async fn image_result_live_and_replay_render_in_the_owning_call() {
+     assert_eq!(outputs[0], outputs[1]);
+     insta::assert_snapshot!(outputs[0]);
+ }
++
++#[tokio::test]
++async fn compact_main_view_fullscreen_live_disclosure_survives_commit_and_resize() {
++    use crate::transcript_view::TranscriptView;
++    use crate::transcript_view::tests::{render, text};
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    let (mut chat, mut events, _ops) = make_chatwidget_manual(None).await;
++    let command = vec!["bash".into(), "-lc".into(), "echo live".into()];
++    let parsed = codex_shell_command::parse_command::parse_command(&command);
++    chat.transcript.active_cell = Some(Box::new(crate::exec_cell::new_active_exec_command(
++        "live".into(),
++        command,
++        parsed,
++        ExecCommandSource::Agent,
++        None,
++        false,
++    )));
++    let mut view = TranscriptView::default();
++    let mut cells: Vec<Arc<dyn HistoryCell>> = Vec::new();
++    let sync =
++        |view: &mut TranscriptView, chat: &ChatWidget, cells: &[Arc<dyn HistoryCell>], width| {
++            view.sync_live_activity_summary(chat.active_activity_summary());
++            let expanded = view.sync_live_activity(cells, chat.active_activity_ids());
++            view.sync_live_activity_tail(cells, width, None, expanded, |width, members| {
++                chat.active_cell_owned_transcript_lines(width, expanded, members)
++            });
++        };
++    sync(&mut view, &chat, &cells, 80);
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 20)).trim_end(),
++        "• Running echo live"
++    );
++    for key in [KeyCode::F(4), KeyCode::Enter] {
++        view.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &cells);
++        sync(&mut view, &chat, &cells, 80);
++        render(&mut view, &cells, 80, 20);
++    }
++    let expanded = text(&render(&mut view, &cells, 80, 20));
++    assert!(expanded.contains("$ echo live"), "{expanded}");
++    chat.transcript
++        .active_cell
++        .as_mut()
++        .unwrap()
++        .as_any_mut()
++        .downcast_mut::<ExecCell>()
++        .unwrap()
++        .complete_call(
++            "live",
++            crate::exec_cell::CommandOutput::new(0, "live output\n".into()),
++            Duration::ZERO,
++        );
++    chat.flush_active_cell();
++    while let Ok(event) = events.try_recv() {
++        if let AppEvent::InsertHistoryCell(cell) = event {
++            cells.push(cell.into());
++        }
++    }
++    for width in [80, 40] {
++        sync(&mut view, &chat, &cells, width);
++        let displayed = text(&render(&mut view, &cells, width, 20));
++        assert!(
++            displayed.starts_with("• 1 command\n$ echo live\nlive output"),
++            "{displayed}"
++        );
++    }
++    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &cells);
++    assert_eq!(
++        text(&render(&mut view, &cells, 40, 20)).trim_end(),
++        "• 1 command\n• Ran echo live"
++    );
++    for key in [KeyCode::Home, KeyCode::Left] {
++        view.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &cells);
++        render(&mut view, &cells, 40, 20);
++    }
++    assert_eq!(
++        text(&render(&mut view, &cells, 40, 20)).trim_end(),
++        "• 1 command"
++    );
++}
 diff --git a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs b/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
 index 135aabc..c583bfe 100644
 --- a/codex-rs/tui/src/chatwidget/tool_lifecycle.rs
@@ -1918,6 +2055,46 @@ index 395a874..0a6e641 100644
  // Shared row for per-file presentation
  struct Row<'a> {
      path: &'a Path,
+diff --git a/codex-rs/tui/src/exec_cell/compact.rs b/codex-rs/tui/src/exec_cell/compact.rs
+index f8fe1bb..7d9fd34 100644
+--- a/codex-rs/tui/src/exec_cell/compact.rs
++++ b/codex-rs/tui/src/exec_cell/compact.rs
+@@ -69,8 +69,16 @@ impl ExecCell {
+         let [call] = self.group.calls.as_slice() else {
+             return Vec::new();
+         };
++        self.compact_call_lines(call, width)
++    }
++
++    pub(super) fn compact_call_lines(
++        &self,
++        call: &super::model::ExecCall,
++        width: u16,
++    ) -> Vec<HyperlinkLine> {
+         if call.is_unified_exec_interaction()
+-            && !self.is_active()
++            && call.duration.is_some()
+             && call.output.as_ref().is_some_and(|output| {
+                 output.exit_code == 0 && output.lines().all(|line| line.trim().is_empty())
+             })
+@@ -80,7 +88,7 @@ impl ExecCell {
+         let failed = call.output.as_ref().filter(|output| output.exit_code != 0);
+         let marker = if failed.is_some() {
+             "•".red().bold()
+-        } else if self.is_active() {
++        } else if call.duration.is_none() {
+             activity_indicator(
+                 call.start_time,
+                 MotionMode::from_animations_enabled(self.animations_enabled()),
+@@ -92,7 +100,7 @@ impl ExecCell {
+         };
+         let title = if let Some(output) = failed {
+             format!("Failed (exit {})", output.exit_code)
+-        } else if self.is_active() {
++        } else if call.duration.is_none() {
+             "Running".to_owned()
+         } else if call.is_unified_exec_interaction() {
+             "Background output".to_owned()
 diff --git a/codex-rs/tui/src/exec_cell/model.rs b/codex-rs/tui/src/exec_cell/model.rs
 index a99ea49..4e450a1 100644
 --- a/codex-rs/tui/src/exec_cell/model.rs
@@ -1946,7 +2123,7 @@ index a99ea49..4e450a1 100644
          matches!(self.source, ExecCommandSource::UserShell)
      }
 diff --git a/codex-rs/tui/src/exec_cell/render.rs b/codex-rs/tui/src/exec_cell/render.rs
-index bae014e..a86fe9e 100644
+index bae014e..1e3ebab 100644
 --- a/codex-rs/tui/src/exec_cell/render.rs
 +++ b/codex-rs/tui/src/exec_cell/render.rs
 @@ -7,6 +7,8 @@ use super::model::ExecCall;
@@ -2098,7 +2275,7 @@ index bae014e..a86fe9e 100644
 +        }
 +        if !lines.is_empty() {
 +            return plain_hyperlink_lines(lines);
-+        }
+         }
 +        if self
 +            .group
 +            .calls
@@ -2106,7 +2283,7 @@ index bae014e..a86fe9e 100644
 +            .all(ExecCall::is_unified_exec_interaction)
 +        {
 +            return Vec::new();
-         }
++        }
 +        // One summary row per agent action; Ctrl+T keeps the output.
 +        let (mut preview, keep) = if self.is_exploring_cell() {
 +            (self.exploring_display_lines(width), 2)
@@ -2121,7 +2298,53 @@ index bae014e..a86fe9e 100644
      }
  
      fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-@@ -311,6 +378,14 @@ impl ExecCell {
+@@ -293,6 +360,45 @@ impl HistoryCell for ExecCell {
+             .collect()
+     }
+ 
++    fn activity_member_ids(&self) -> Vec<Vec<String>> {
++        self.iter_calls()
++            .filter(|call| !call.is_unified_exec_interaction())
++            .map(|call| vec![format!("exec:{}", call.call_id)])
++            .collect()
++    }
++
++    fn activity_member_lines(
++        &self,
++        width: u16,
++        ids: &[String],
++        expanded: bool,
++    ) -> Vec<HyperlinkLine> {
++        let Some((index, call)) = self
++            .iter_calls()
++            .enumerate()
++            .find(|(_, call)| ids.contains(&format!("exec:{}", call.call_id)))
++        else {
++            return Vec::new();
++        };
++        if expanded {
++            return self.detailed_call_lines(index, call, width, HistoryRenderMode::Rich);
++        }
++        if Self::is_exploring_call(call) {
++            let mut lines = self.exploring_display_lines_for_calls(u16::MAX, &[call]);
++            if lines.len() > 1 {
++                let mut line = lines.remove(1).line;
++                line.spans[0] = "• ".dim();
++                return vec![crate::history_cell::activity_preview::clipped_line(
++                    line, width,
++                )];
++            }
++        }
++        self.compact_call_lines(call, width)
++            .into_iter()
++            .take(1)
++            .collect()
++    }
++
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+         plain_lines(visible_lines(
+             self.detailed_hyperlink_lines(u16::MAX, HistoryRenderMode::Raw),
+@@ -311,6 +417,14 @@ impl ExecCell {
      }
  
      fn exploring_display_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -2136,7 +2359,7 @@ index bae014e..a86fe9e 100644
          let mut out: Vec<HyperlinkLine> = Vec::new();
          out.push(
              Line::from(vec![
-@@ -329,7 +404,7 @@ impl ExecCell {
+@@ -329,7 +443,7 @@ impl ExecCell {
              .into(),
          );
  
@@ -2145,7 +2368,7 @@ index bae014e..a86fe9e 100644
          let mut out_indented = Vec::new();
          let nonzero_exit = |call: &ExecCall| {
              call.duration
-@@ -1359,4 +1434,154 @@ mod tests {
+@@ -1359,4 +1473,154 @@ mod tests {
              "expected the complete URL, got: {rendered:?}"
          );
      }
@@ -2300,6 +2523,116 @@ index bae014e..a86fe9e 100644
 +        );
 +    }
  }
+diff --git a/codex-rs/tui/src/exec_cell/transcript.rs b/codex-rs/tui/src/exec_cell/transcript.rs
+index 43ed4ce..a26ec95 100644
+--- a/codex-rs/tui/src/exec_cell/transcript.rs
++++ b/codex-rs/tui/src/exec_cell/transcript.rs
+@@ -19,53 +19,65 @@ impl ExecCell {
+         width: u16,
+         mode: HistoryRenderMode,
+     ) -> Vec<HyperlinkLine> {
+-        let mut lines: Vec<HyperlinkLine> = vec![];
+-        for (i, call) in self.iter_calls().enumerate() {
+-            if i > 0 {
++        let mut lines = Vec::new();
++        for (index, call) in self.iter_calls().enumerate() {
++            if index > 0 {
+                 lines.push("".into());
+             }
+-            let script = strip_bash_lc_and_escape(&call.command);
+-            let highlighted_script = highlight_bash_to_lines(&script);
+-            let cmd_display = adaptive_wrap_hyperlink_lines(
+-                &plain_hyperlink_lines(highlighted_script),
+-                RtOptions::new(width as usize)
+-                    .initial_indent("$ ".magenta().into())
+-                    .subsequent_indent("    ".into()),
+-            );
+-            lines.extend(cmd_display);
++            lines.extend(self.detailed_call_lines(index, call, width, mode));
++        }
++        lines
++    }
+ 
+-            if let Some(output) = call.output.as_ref() {
+-                if !call.is_unified_exec_interaction() {
+-                    let wrap_width = width.max(/*other*/ 1) as usize;
+-                    let wrap_opts = RtOptions::new(wrap_width);
+-                    for unwrapped in output
+-                        .transcript_lines()
+-                        .map(|line| ansi_escape_line(line.as_ref()))
+-                    {
+-                        lines.extend(adaptive_wrap_hyperlink_lines(
+-                            &[unwrapped.into()],
+-                            wrap_opts.clone(),
+-                        ));
+-                    }
++    pub(super) fn detailed_call_lines(
++        &self,
++        index: usize,
++        call: &super::model::ExecCall,
++        width: u16,
++        mode: HistoryRenderMode,
++    ) -> Vec<HyperlinkLine> {
++        let mut lines = Vec::new();
++        let script = strip_bash_lc_and_escape(&call.command);
++        let highlighted_script = highlight_bash_to_lines(&script);
++        let cmd_display = adaptive_wrap_hyperlink_lines(
++            &plain_hyperlink_lines(highlighted_script),
++            RtOptions::new(width as usize)
++                .initial_indent("$ ".magenta().into())
++                .subsequent_indent("    ".into()),
++        );
++        lines.extend(cmd_display);
++
++        if let Some(output) = call.output.as_ref() {
++            if !call.is_unified_exec_interaction() {
++                let wrap_width = width.max(/*other*/ 1) as usize;
++                let wrap_opts = RtOptions::new(wrap_width);
++                for unwrapped in output
++                    .transcript_lines()
++                    .map(|line| ansi_escape_line(line.as_ref()))
++                {
++                    lines.extend(adaptive_wrap_hyperlink_lines(
++                        &[unwrapped.into()],
++                        wrap_opts.clone(),
++                    ));
+                 }
+-                if call.duration.is_some() || output.exit_code != 0 {
+-                    let mut result: Line = if output.exit_code == 0 {
+-                        Line::from("✓".green().bold())
+-                    } else {
+-                        Line::from(vec![
+-                            "✗".red().bold(),
+-                            format!(" ({})", output.exit_code).into(),
+-                        ])
+-                    };
+-                    if let Some(duration) = call.duration {
+-                        let duration = format_duration(duration);
+-                        result.push_span(format!(" • {duration}").dim());
+-                    }
+-                    lines.push(result.into());
++            }
++            if call.duration.is_some() || output.exit_code != 0 {
++                let mut result: Line = if output.exit_code == 0 {
++                    Line::from("✓".green().bold())
++                } else {
++                    Line::from(vec![
++                        "✗".red().bold(),
++                        format!(" ({})", output.exit_code).into(),
++                    ])
++                };
++                if let Some(duration) = call.duration {
++                    let duration = format_duration(duration);
++                    result.push_span(format!(" • {duration}").dim());
+                 }
++                lines.push(result.into());
+             }
+-            lines.extend(self.group.details.lines_after(i + 1, width, mode));
+         }
++        lines.extend(self.group.details.lines_after(index + 1, width, mode));
+         lines
+     }
+ }
 diff --git a/codex-rs/tui/src/history_cell/activity_summary.rs b/codex-rs/tui/src/history_cell/activity_summary.rs
 new file mode 100644
 index 0000000..570c653
@@ -2389,7 +2722,7 @@ index 0000000..570c653
 +    }
 +}
 diff --git a/codex-rs/tui/src/history_cell/computer_activity.rs b/codex-rs/tui/src/history_cell/computer_activity.rs
-index 7ef3342..251e1fb 100644
+index 7ef3342..1eee601 100644
 --- a/codex-rs/tui/src/history_cell/computer_activity.rs
 +++ b/codex-rs/tui/src/history_cell/computer_activity.rs
 @@ -119,6 +119,22 @@ fn error_preview(call: &McpToolCallCell) -> Option<&str> {
@@ -2415,6 +2748,47 @@ index 7ef3342..251e1fb 100644
      fn append_reasoning(&mut self, cell: Box<dyn HistoryCell>) -> Result<(), Box<dyn HistoryCell>> {
          if self.group.calls.is_empty() {
              Err(cell)
+@@ -264,6 +280,40 @@ impl HistoryCell for ComputerActivityCell {
+         self.call_ids().map(|id| format!("mcp:{id}")).collect()
+     }
+ 
++    fn activity_member_ids(&self) -> Vec<Vec<String>> {
++        self.group
++            .calls
++            .iter()
++            .map(HistoryCell::activity_ids)
++            .collect()
++    }
++
++    fn activity_member_lines(
++        &self,
++        width: u16,
++        ids: &[String],
++        expanded: bool,
++    ) -> Vec<HyperlinkLine> {
++        let Some((index, call)) = self
++            .group
++            .calls
++            .iter()
++            .enumerate()
++            .find(|(_, call)| call.activity_ids().iter().any(|id| ids.contains(id)))
++        else {
++            return Vec::new();
++        };
++        let mut lines = call.activity_member_lines(width, ids, expanded);
++        if expanded {
++            lines.extend(
++                self.group
++                    .details
++                    .lines_after(index + 1, width, HistoryRenderMode::Rich),
++            );
++        }
++        lines
++    }
++
+     fn raw_lines(&self) -> Vec<Line<'static>> {
+         plain_lines(visible_lines(
+             self.detailed_hyperlink_lines(u16::MAX, HistoryRenderMode::Raw),
 diff --git a/codex-rs/tui/src/history_cell/dynamic.rs b/codex-rs/tui/src/history_cell/dynamic.rs
 index 9c5c603..f9ebd76 100644
 --- a/codex-rs/tui/src/history_cell/dynamic.rs
@@ -2478,7 +2852,7 @@ index 9f80e5e..26a960e 100644
          vec![format!("mcp:{}", self.call_id)]
      }
 diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index ac39aef..bd6118a 100644
+index ac39aef..6e69317 100644
 --- a/codex-rs/tui/src/history_cell/mod.rs
 +++ b/codex-rs/tui/src/history_cell/mod.rs
 @@ -10,6 +10,10 @@
@@ -2508,6 +2882,33 @@ index ac39aef..bd6118a 100644
      /// Returns the logical lines for the main chat viewport.
      fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
  
+@@ -255,6 +268,26 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
+         Vec::new()
+     }
+ 
++    fn activity_member_ids(&self) -> Vec<Vec<String>> {
++        vec![self.activity_ids()]
++    }
++
++    fn activity_member_lines(
++        &self,
++        width: u16,
++        _ids: &[String],
++        expanded: bool,
++    ) -> Vec<HyperlinkLine> {
++        if expanded {
++            self.expanded_hyperlink_lines(width)
++        } else {
++            self.compact_hyperlink_lines(width)
++                .into_iter()
++                .take(1)
++                .collect()
++        }
++    }
++
+     /// Available activity details, preserving source order and any upstream truncation notices.
+     fn expanded_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
+         self.transcript_hyperlink_lines(width)
 diff --git a/codex-rs/tui/src/history_cell/patches.rs b/codex-rs/tui/src/history_cell/patches.rs
 index 3569c7c..8f0e75b 100644
 --- a/codex-rs/tui/src/history_cell/patches.rs
@@ -3160,7 +3561,7 @@ index 2a9d327..0396906 100644
 +    assert_eq!(rendered.matches("added line").count(), 2);
 +}
 diff --git a/codex-rs/tui/src/transcript_view.rs b/codex-rs/tui/src/transcript_view.rs
-index 31ebfec..2083ea9 100644
+index 31ebfec..9648931 100644
 --- a/codex-rs/tui/src/transcript_view.rs
 +++ b/codex-rs/tui/src/transcript_view.rs
 @@ -6,6 +6,7 @@
@@ -3171,7 +3572,15 @@ index 31ebfec..2083ea9 100644
  mod bookmark;
  mod composer_gap;
  mod copy_mode;
-@@ -96,6 +97,9 @@ pub(crate) struct TranscriptView {
+@@ -42,6 +43,7 @@ use selection::Selection;
+ use snapshot::ViewSnapshot;
+ use text::TextLayout;
+ 
++pub(crate) use activity_runs::ActivityMember;
+ pub(crate) use bookmark::TranscriptBookmark;
+ pub(crate) use input::JumpTarget;
+ pub(crate) use input::ViewAction;
+@@ -96,11 +98,15 @@ pub(crate) struct TranscriptView {
      composer_tip: Option<(Rect, HyperlinkLine)>,
      turn_tip_key: Option<EntryKey>,
      cache: LayoutCache,
@@ -3181,7 +3590,13 @@ index 31ebfec..2083ea9 100644
      live: Option<Arc<TextLayout>>,
      live_separated: Option<Arc<TextLayout>>,
      live_key: Option<(u16, ActiveCellTranscriptKey)>,
-@@ -117,6 +121,7 @@ pub(crate) struct TranscriptView {
+     live_continuation: bool,
+     area: Rect,
++    prompt_header: Option<(Rect, Anchor)>,
+     suppressed_prompt_header: Option<prompt_header::SuppressedHeader>,
+     visible: Vec<VisibleRow>,
+     selection: Option<Selection>,
+@@ -117,6 +123,7 @@ pub(crate) struct TranscriptView {
      last_tail: Option<EntryKey>,
      last_click: Option<(std::time::Instant, u16, u16, u8)>,
      disclosure: disclosure::Disclosure,
@@ -3189,7 +3604,7 @@ index 31ebfec..2083ea9 100644
  }
  
  impl Default for TranscriptView {
-@@ -132,6 +137,9 @@ impl Default for TranscriptView {
+@@ -132,11 +139,15 @@ impl Default for TranscriptView {
              composer_tip: None,
              turn_tip_key: None,
              cache: LayoutCache::default(),
@@ -3199,7 +3614,13 @@ index 31ebfec..2083ea9 100644
              live: None,
              live_separated: None,
              live_key: None,
-@@ -153,6 +161,7 @@ impl Default for TranscriptView {
+             live_continuation: false,
+             area: Rect::default(),
++            prompt_header: None,
+             suppressed_prompt_header: None,
+             visible: Vec::new(),
+             selection: None,
+@@ -153,6 +164,7 @@ impl Default for TranscriptView {
              last_tail: None,
              last_click: None,
              disclosure: disclosure::Disclosure::default(),
@@ -3207,7 +3628,46 @@ index 31ebfec..2083ea9 100644
          }
      }
  }
-@@ -305,17 +314,34 @@ impl TranscriptView {
+@@ -173,6 +185,7 @@ impl TranscriptView {
+ 
+     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, cells: &[Arc<dyn HistoryCell>]) {
+         self.composer_tip = None;
++        self.prompt_header = None;
+         self.cache.begin_frame();
+         self.sync_history_tail(cells);
+         let current_cells = cells;
+@@ -217,8 +230,18 @@ impl TranscriptView {
+             }
+             // Following may advance into the next turn after reserving the header row.
+             start = self.start(cells);
+-            if let Some(header) = prompt_header::line(cells, start.0, area.width) {
+-                header.render(Rect::new(area.x, area.y, area.width, /*height*/ 1), buf);
++            if let Some((index, header)) = prompt_header::line(cells, start.0, area.width) {
++                let header_area = Rect::new(area.x, area.y, area.width, /*height*/ 1);
++                header.render(header_area, buf);
++                self.prompt_header = Some((
++                    header_area,
++                    Anchor {
++                        key: self.entry_key(cells, index),
++                        index,
++                        offset: 0,
++                        row_bias: 0,
++                    },
++                ));
+             } else {
+                 body = area;
+                 self.area = area;
+@@ -259,6 +282,9 @@ impl TranscriptView {
+             };
+             let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
+             layout.render(row_area, buf, row);
++            let activity_ids = layout
++                .activity_region(row)
++                .map_or(activity_ids, |region| region.ids.clone().into());
+             self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
+             if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()
+             {
+@@ -305,17 +331,53 @@ impl TranscriptView {
  
      pub(crate) fn sync_live_activity_tail(
          &mut self,
@@ -3215,13 +3675,18 @@ index 31ebfec..2083ea9 100644
          width: u16,
          key: Option<ActiveCellTranscriptKey>,
          expanded: bool,
-         lines: impl FnOnce(u16) -> Option<ActivityTranscriptLines>,
+-        lines: impl FnOnce(u16) -> Option<ActivityTranscriptLines>,
++        lines: impl FnOnce(u16, &std::collections::HashSet<String>) -> Option<ActivityTranscriptLines>,
      ) -> bool {
 +        self.prepare_activity_run(cells, cells.len());
-+        let summary = self
-+            .compact_activity_run(cells, cells.len())
-+            .filter(|run| run.head == Some(cells.len()) && !expanded)
++        let run = self.compact_activity_run(cells, cells.len());
++        let summary = run
++            .filter(|run| run.head == Some(cells.len()))
 +            .map(|run| run.summary);
++        let grouped = run.is_some();
++        let run_id = run.map(|run| run.id.clone());
++        let expanded_members = self.disclosure.expanded.clone();
++        let ids = self.disclosure.live_ids.clone();
 +        if self.live_run_summary != summary {
 +            self.live_run_summary = summary;
 +            self.live_key = None;
@@ -3232,18 +3697,33 @@ index 31ebfec..2083ea9 100644
              .primary_hint(crate::keymap::KeymapContext::Global, "open_transcript");
          self.sync_live_layout(width, key, |width| {
 -            lines(width).map(|lines| layout::activity_layout(lines, width, expanded, shortcut))
-+            lines(width).map(|mut lines| {
-+                if let Some(summary) = summary {
-+                    let mut activity = summary.lines(width);
-+                    activity.extend(lines.activity);
-+                    lines.activity = activity;
++            lines(width, &expanded_members).map(|lines| {
++                if grouped {
++                    let mut members = if expanded && !lines.members.is_empty() {
++                        lines.members
++                    } else {
++                        vec![activity_runs::ActivityMember {
++                            ids,
++                            lines: lines.activity,
++                        }]
++                    };
++                    members.push(activity_runs::ActivityMember {
++                        ids: Vec::new(),
++                        lines: lines.auxiliary,
++                    });
++                    activity_runs::member_layout(
++                        summary.map(|summary| (summary, run_id.unwrap())),
++                        members,
++                        width,
++                    )
++                } else {
++                    layout::activity_layout(lines, width, expanded, shortcut)
 +                }
-+                layout::activity_layout(lines, width, expanded, shortcut)
 +            })
          })
      }
  
-@@ -373,6 +399,12 @@ impl TranscriptView {
+@@ -373,6 +435,12 @@ impl TranscriptView {
          self.selection.is_some() || self.search.is_active() || self.is_activity_focused()
      }
  
@@ -3256,12 +3736,21 @@ index 31ebfec..2083ea9 100644
      pub(crate) fn is_detailed(&self) -> bool {
          self.detailed
      }
+@@ -645,7 +713,7 @@ impl TranscriptView {
+ 
+ #[cfg(test)]
+ #[path = "transcript_view_tests.rs"]
+-mod tests;
++pub(crate) mod tests;
+ 
+ #[cfg(test)]
+ #[path = "transcript_view/markdown_copy_tests.rs"]
 diff --git a/codex-rs/tui/src/transcript_view/activity_runs.rs b/codex-rs/tui/src/transcript_view/activity_runs.rs
 new file mode 100644
-index 0000000..5476fe0
+index 0000000..0ba8a64
 --- /dev/null
 +++ b/codex-rs/tui/src/transcript_view/activity_runs.rs
-@@ -0,0 +1,144 @@
+@@ -0,0 +1,180 @@
 +//! Project compact runs onto their first visible member while retaining per-cell identities.
 +
 +use crate::history_cell::ActivitySummary;
@@ -3281,6 +3770,7 @@ index 0000000..5476fe0
 +    pub(super) summary: ActivitySummary,
 +    pub(super) ids: Vec<String>,
 +    pub(super) expanded: bool,
++    pub(super) id: String,
 +    members: Vec<usize>,
 +}
 +
@@ -3372,10 +3862,8 @@ index 0000000..5476fe0
 +            run.ids.extend(self.disclosure.live_ids.iter().cloned());
 +            run.members.push(cells.len());
 +        }
-+        run.expanded = self.disclosure.is_expanded(&run.ids);
-+        if run.expanded {
-+            self.disclosure.expanded.extend(run.ids.iter().cloned());
-+        }
++        run.id = format!("run:{}", run.ids.first().cloned().unwrap_or_default());
++        run.expanded = self.disclosure.expanded.contains(&run.id);
 +        self.activity_runs.push(run);
 +    }
 +
@@ -3406,6 +3894,43 @@ index 0000000..5476fe0
 +        self.key = None;
 +    }
 +}
++
++pub(crate) struct ActivityMember {
++    pub(crate) ids: Vec<String>,
++    pub(crate) lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
++}
++
++pub(super) fn member_layout(
++    summary: Option<(ActivitySummary, String)>,
++    members: Vec<ActivityMember>,
++    width: u16,
++) -> TextLayout {
++    let mut lines = Vec::new();
++    let mut regions = Vec::new();
++    let mut offset = 0;
++    let summary = summary.map(|(summary, id)| ActivityMember {
++        ids: vec![id],
++        lines: summary.lines(width),
++    });
++    for member in summary.into_iter().chain(members) {
++        if member.lines.is_empty() {
++            continue;
++        }
++        let len = TextLayout::new(member.lines.clone(), width).text().len();
++        if !member.ids.is_empty() {
++            regions.push(super::text::ActivityRegion {
++                source: offset..offset + len + 1,
++                ids: member.ids,
++            });
++        }
++        offset += len + 1;
++        lines.extend(member.lines);
++    }
++    let mut layout = TextLayout::new(lines, width);
++    layout.disclosure = !regions.is_empty();
++    layout.activity_regions = regions;
++    layout
++}
 diff --git a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs b/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
 index ffce6a7..ea5c190 100644
 --- a/codex-rs/tui/src/transcript_view/copy_mode_tests.rs
@@ -3429,39 +3954,64 @@ index ffce6a7..ea5c190 100644
      );
      insta::assert_snapshot!(text(&buffer));
 diff --git a/codex-rs/tui/src/transcript_view/disclosure.rs b/codex-rs/tui/src/transcript_view/disclosure.rs
-index d221387..46937d4 100644
+index d221387..2c84fd2 100644
 --- a/codex-rs/tui/src/transcript_view/disclosure.rs
 +++ b/codex-rs/tui/src/transcript_view/disclosure.rs
-@@ -69,16 +69,22 @@ impl TranscriptView {
+@@ -69,16 +69,29 @@ impl TranscriptView {
          }
          if self.disclosure.live_ids != ids {
              self.live_key = None;
+-        }
+-        let expanded = self.disclosure.is_expanded(&ids);
+-        if expanded {
+-            self.disclosure.expanded.extend(ids.iter().cloned());
 +            self.activity_runs.invalidate();
          }
-+        self.disclosure.live_ids = ids;
+         self.disclosure.live_ids = ids;
+-        expanded
 +        self.prepare_activity_run(cells, cells.len());
 +        let ids = self.activity_ids(cells, cells.len());
-         let expanded = self.disclosure.is_expanded(&ids);
-         if expanded {
-             self.disclosure.expanded.extend(ids.iter().cloned());
-         }
--        self.disclosure.live_ids = ids;
-         expanded
++        self.compact_activity_run(cells, cells.len())
++            .map_or_else(|| self.disclosure.is_expanded(&ids), |run| run.expanded)
      }
  
      pub(super) fn activity_ids(&self, cells: &[Arc<dyn HistoryCell>], index: usize) -> Vec<String> {
 +        if let Some(run) = self.compact_activity_run(cells, index) {
-+            return run.ids.clone();
++            let mut ids = cells.get(index).map_or_else(
++                || self.disclosure.live_ids.clone(),
++                |cell| cell.activity_ids(),
++            );
++            if run.head == Some(index) {
++                ids.push(run.id.clone());
++            }
++            if ids.is_empty() {
++                ids.push(format!("activity:{:?}", self.entry_key(cells, index)));
++            }
++            return ids;
 +        }
          cells.get(index).map_or_else(
              || self.disclosure.live_ids.clone(),
              |cell| cell.activity_ids(),
-@@ -148,11 +154,13 @@ impl TranscriptView {
+@@ -128,7 +141,11 @@ impl TranscriptView {
+                     .bold()
+                     .remove_modifier(Modifier::DIM),
+             );
+-        } else if row == usize::from(layout.separated) {
++        } else if layout
++            .activity_region(row)
++            .is_some_and(|region| layout.row_for_offset(region.source.start) == row)
++            || (layout.activity_regions.is_empty() && row == usize::from(layout.separated))
++        {
+             buf.set_style(area, Style::default().underlined());
+         }
+     }
+@@ -148,17 +165,26 @@ impl TranscriptView {
          else {
              return false;
          };
 -        if visible.layout.disclosure_row() != Some(visible.row)
 -            || column
++        let region = visible.layout.activity_region(visible.row);
 +        let on_control = visible.layout.disclosure_row() == Some(visible.row)
 +            && column
                  .checked_sub(self.area.x)
@@ -3470,23 +4020,302 @@ index d221387..46937d4 100644
 +                .is_some_and(|column| visible.layout.disclosure_columns().contains(&column));
 +        let on_header =
 +            visible.layout.disclosure && visible.row == usize::from(visible.layout.separated);
-+        if !on_control && !on_header {
++        let on_detail = visible.layout.disclosure_row().is_some() && visible.layout.disclosure;
++        if region.is_none() && !on_control && !on_header && !on_detail {
              return false;
          }
-         let Some(index) = self.canonical_activity_index(cells, &visible.activity_ids) else {
-@@ -364,6 +372,7 @@ impl TranscriptView {
-         self.disclosure.focused = Some(ids);
+-        let Some(index) = self.canonical_activity_index(cells, &visible.activity_ids) else {
++        let ids = region.map_or_else(
++            || visible.activity_ids.to_vec(),
++            |region| region.ids.clone(),
++        );
++        self.prepare_activity_run(cells, visible.index);
++        let Some(index) = self.canonical_activity_index(cells, &ids) else {
+             return false;
+         };
+-        self.toggle_activity(cells, index);
++        self.toggle_activity(cells, index, ids, Some(row));
+         true
+     }
+ 
+@@ -170,22 +196,23 @@ impl TranscriptView {
+         if self.detailed || self.mode != HistoryRenderMode::Rich || self.is_search_editing() {
+             return None;
+         }
+-        if self.disclosure.keymap.app.focus_activity.is_pressed(key) {
++        let focus_pressed = self.disclosure.keymap.app.focus_activity.is_pressed(key);
++        if !focus_pressed && self.disclosure.focused.is_none() {
++            return None;
++        }
++        let targets = self.disclosure_targets(cells);
++        if focus_pressed {
+             if self.is_activity_focused() {
+                 self.disclosure.focused = None;
+             } else {
+                 self.end_selection(cells);
+-                let visible = self
+-                    .visible
+-                    .iter()
+-                    .rev()
+-                    .find_map(|row| self.canonical_activity_index(cells, &row.activity_ids));
+-                for index in visible.into_iter().chain((0..=cells.len()).rev()) {
+-                    if !self.activity_ids(cells, index).is_empty()
+-                        && self.focus_activity(cells, index)
+-                    {
+-                        break;
+-                    }
++                let visible = self.visible.iter().rev().find_map(|row| {
++                    targets
++                        .iter()
++                        .position(|(_, ids, _)| ids.iter().any(|id| row.activity_ids.contains(id)))
++                });
++                if let Some(target) = visible.or_else(|| targets.len().checked_sub(1)) {
++                    self.focus_target(cells, &targets[target]);
+                 }
+             }
+             return Some(ViewAction::Changed);
+@@ -194,77 +221,85 @@ impl TranscriptView {
+             .disclosure
+             .focused
+             .as_ref()
+-            .and_then(|ids| self.canonical_activity_index(cells, ids));
++            .and_then(|ids| targets.iter().position(|(_, target, _)| target == ids));
+         let Some(focused) = focused else {
+             self.disclosure.focused = None;
+             return None;
+         };
+         let Some(action) = self.disclosure.keymap.list.action_for(key) else {
+-            // Ordinary text resumes composing; activity navigation never becomes a text editor.
+             self.disclosure.focused = None;
+             return None;
+         };
++        let (index, ids, _) = &targets[focused];
+         match action {
+             ListAction::Cancel => self.disclosure.focused = None,
+-            ListAction::Accept => self.toggle_activity(cells, focused),
++            ListAction::Accept => self.toggle_activity(cells, *index, ids.clone(), None),
+             ListAction::MoveLeft | ListAction::MoveRight => {
+-                let ids = self.activity_ids(cells, focused);
+-                let expanded = self.disclosure.is_expanded(&ids)
+-                    || self.is_search_expanded(self.entry_key(cells, focused));
++                let expanded = self.disclosure.is_expanded(ids)
++                    || self.is_search_expanded(self.entry_key(cells, *index));
+                 if expanded != (action == ListAction::MoveRight) {
+-                    self.toggle_activity(cells, focused);
++                    self.toggle_activity(cells, *index, ids.clone(), None);
+                 }
+             }
+-            ListAction::MoveUp
+-            | ListAction::MoveDown
+-            | ListAction::PageUp
+-            | ListAction::PageDown
+-            | ListAction::JumpTop
+-            | ListAction::JumpBottom => {
+-                let (mut range, backwards, steps) = match action {
+-                    ListAction::MoveUp => (0..focused, true, 1),
+-                    ListAction::PageUp => (0..focused, true, 5),
+-                    ListAction::JumpTop => (0..cells.len() + 1, false, 1),
+-                    ListAction::MoveDown => (focused + 1..cells.len() + 1, false, 1),
+-                    ListAction::PageDown => (focused + 1..cells.len() + 1, false, 5),
+-                    ListAction::JumpBottom => (0..cells.len() + 1, true, 1),
+-                    ListAction::MoveLeft
+-                    | ListAction::MoveRight
+-                    | ListAction::Accept
+-                    | ListAction::Cancel => unreachable!(),
++            _ => {
++                let next = match action {
++                    ListAction::MoveUp => focused.saturating_sub(1),
++                    ListAction::PageUp => focused.saturating_sub(5),
++                    ListAction::JumpTop => 0,
++                    ListAction::MoveDown => (focused + 1).min(targets.len() - 1),
++                    ListAction::PageDown => (focused + 5).min(targets.len() - 1),
++                    ListAction::JumpBottom => targets.len() - 1,
++                    _ => unreachable!(),
+                 };
+-                let mut next = focused;
+-                for _ in 0..steps {
+-                    let candidate = if backwards {
+-                        range
+-                            .by_ref()
+-                            .rev()
+-                            .find(|index| !self.activity_ids(cells, *index).is_empty())
+-                    } else {
+-                        range
+-                            .by_ref()
+-                            .find(|index| !self.activity_ids(cells, *index).is_empty())
+-                    };
+-                    let Some(index) = candidate else { break };
+-                    next = index;
+-                }
+-                loop {
+-                    if self.focus_activity(cells, next) {
+-                        break;
+-                    }
+-                    let candidate = if backwards {
+-                        range.next_back()
+-                    } else {
+-                        range.next()
+-                    };
+-                    let Some(index) = candidate else { break };
+-                    next = index;
+-                }
++                self.focus_target(cells, &targets[next]);
+             }
+         }
+         Some(ViewAction::Changed)
+     }
+ 
++    fn disclosure_targets(
++        &mut self,
++        cells: &[Arc<dyn HistoryCell>],
++    ) -> Vec<(usize, Vec<String>, usize)> {
++        let mut targets = Vec::new();
++        for index in 0..=cells.len() {
++            let Some(layout) = self.layout(cells, index) else {
++                continue;
++            };
++            if !layout.activity_regions.is_empty() {
++                targets.extend(
++                    layout
++                        .activity_regions
++                        .iter()
++                        .map(|region| (index, region.ids.clone(), region.source.start)),
++                );
++            } else if layout.disclosure {
++                targets.push((index, self.activity_ids(cells, index), 0));
++            }
++        }
++        targets
++    }
++
++    fn focus_target(
++        &mut self,
++        cells: &[Arc<dyn HistoryCell>],
++        target: &(usize, Vec<String>, usize),
++    ) {
++        let (index, ids, offset) = target;
++        self.disclosure.focused = Some(ids.clone());
++        let visible = self.visible.iter().any(|row| {
++            row.activity_ids.as_ref() == ids && row.layout.row_for_offset(*offset) == row.row
++        });
++        if !visible {
++            self.position = Position::Reading(Anchor {
++                key: self.entry_key(cells, *index),
++                index: *index,
++                offset: *offset,
++                row_bias: 0,
++            });
++        }
++    }
++
+     pub(super) fn canonical_activity_index(
+         &self,
+         cells: &[Arc<dyn HistoryCell>],
+@@ -292,28 +327,13 @@ impl TranscriptView {
+         })
+     }
+ 
+-    fn focus_activity(&mut self, cells: &[Arc<dyn HistoryCell>], index: usize) -> bool {
+-        if self
+-            .current_layout(cells, index)
+-            .is_none_or(|layout| !layout.disclosure)
+-        {
+-            return false;
+-        }
+-        let ids = self.activity_ids(cells, index);
+-        let header_visible = self.visible.iter().any(|row| {
+-            row.layout.disclosure
+-                && row.activity_ids.iter().any(|id| ids.contains(id))
+-                && row.row == usize::from(row.layout.separated)
+-        });
+-        self.disclosure.focused = Some(ids);
+-        if !header_visible {
+-            self.jump_to_entry(cells, index);
+-        }
+-        true
+-    }
+-
+-    fn toggle_activity(&mut self, cells: &[Arc<dyn HistoryCell>], index: usize) {
+-        let ids = self.activity_ids(cells, index);
++    fn toggle_activity(
++        &mut self,
++        cells: &[Arc<dyn HistoryCell>],
++        index: usize,
++        ids: Vec<String>,
++        clicked_row: Option<u16>,
++    ) {
+         if ids.is_empty() {
+             return;
+         }
+@@ -356,19 +376,62 @@ impl TranscriptView {
+                 offset: 0,
+                 row_bias: 0,
+             });
++        let run = self.compact_activity_run(cells, index);
++        let run_id = run.map(|run| run.id.clone());
++        let run_members = run
++            .filter(|run| ids.contains(&run.id))
++            .map(|run| run.ids.clone());
+         if matched || self.disclosure.is_expanded(&ids) {
+             self.disclosure.expanded.retain(|id| !ids.contains(id));
++            if let Some(members) = run_members {
++                self.disclosure.expanded.retain(|id| !members.contains(id));
++            }
+         } else {
++            if let Some(id) = run_id {
++                self.disclosure.expanded.insert(id);
++            }
+             self.disclosure.expanded.extend(ids.iter().cloned());
+         }
+-        self.disclosure.focused = Some(ids);
++        self.disclosure.focused = Some(ids.clone());
          self.position = Position::Reading(anchor);
          self.cache.clear();
 +        self.activity_runs.invalidate();
          self.live_key = None;
          self.live_separated = None;
          if matched {
+             self.invalidate_held_search();
+         }
++        let screen_row = clicked_row.or_else(|| {
++            self.visible
++                .iter()
++                .position(|row| row.activity_ids.as_ref() == ids)
++                .map(|row| self.area.y + row as u16)
++        });
++        if let Some(screen_row) = screen_row
++            && let Some(layout) = self.current_layout(cells, index)
++        {
++            let offset = layout
++                .activity_regions
++                .iter()
++                .find(|region| region.ids == ids)
++                .map_or(0, |region| region.source.start);
++            let target_row = layout.row_for_offset(offset);
++            let (top, row) = self.move_rows(
++                cells,
++                index,
++                target_row,
++                -(screen_row.saturating_sub(self.area.y) as isize),
++            );
++            if let Some(top_layout) = self.layout(cells, top) {
++                let offset = top_layout.position_at(row, 0);
++                self.position = Position::Reading(Anchor {
++                    key: self.entry_key(cells, top),
++                    index: top,
++                    offset,
++                    row_bias: top_layout.row_for_offset(offset) as isize - row as isize,
++                });
++            }
++        }
+     }
+ 
+     pub(super) fn disclosure_footer(&self, width: u16) -> Option<TranscriptFooter> {
 diff --git a/codex-rs/tui/src/transcript_view/footer_tests.rs b/codex-rs/tui/src/transcript_view/footer_tests.rs
-index 309403b..956ec39 100644
+index 309403b..f78a118 100644
 --- a/codex-rs/tui/src/transcript_view/footer_tests.rs
 +++ b/codex-rs/tui/src/transcript_view/footer_tests.rs
-@@ -442,17 +442,23 @@ fn activity_focus_keeps_controls_without_passive_hints() {
+@@ -442,17 +442,24 @@ fn activity_focus_keeps_controls_without_passive_hints() {
      let mut view = TranscriptView::default();
      let render_live = |view: &mut TranscriptView| {
          let expanded = view.sync_live_activity(&cells, cell.activity_ids());
@@ -3506,7 +4335,7 @@ index 309403b..956ec39 100644
 +            /*width*/ 32,
 +            /*key*/ None,
 +            expanded,
-+            |width| {
++            |width, _| {
 +                Some(ActivityTranscriptLines {
 +                    activity: if expanded {
 +                        cell.expanded_hyperlink_lines(width)
@@ -3514,6 +4343,7 @@ index 309403b..956ec39 100644
 +                        cell.compact_hyperlink_lines(width)
 +                    },
 +                    auxiliary: Vec::new(),
++                    members: Vec::new(),
 +                    disclosure: cell.activity_disclosure(width),
 +                })
 +            },
@@ -3521,8 +4351,71 @@ index 309403b..956ec39 100644
          render(view, &[])
      };
      let collapsed = render_live(&mut view);
+diff --git a/codex-rs/tui/src/transcript_view/input.rs b/codex-rs/tui/src/transcript_view/input.rs
+index ced88a7..0d03202 100644
+--- a/codex-rs/tui/src/transcript_view/input.rs
++++ b/codex-rs/tui/src/transcript_view/input.rs
+@@ -245,9 +245,9 @@ impl TranscriptView {
+                 .terminal_destination()
+                 .map(ViewAction::OpenLink);
+         }
+-        let inside = self
+-            .area
+-            .contains(ScreenPosition::new(event.column, event.row));
++        let point = ScreenPosition::new(event.column, event.row);
++        let prompt = self.prompt_header.filter(|(area, _)| area.contains(point));
++        let inside = self.area.contains(point) || prompt.is_some();
+         let dragging = self
+             .selection
+             .as_ref()
+@@ -298,6 +298,27 @@ impl TranscriptView {
+                 self.extend_selection(event.column, event.row);
+             }
+             MouseEventKind::Up(MouseButton::Left) if dragging => {
++                if mode == MouseMode::Interactive
++                    && inside
++                    && event.modifiers.is_empty()
++                    && self.selection.as_ref().is_some_and(|selection| {
++                        !selection.moved
++                            && selection.pointer
++                                == Some(ScreenPosition::new(event.column, event.row))
++                    })
++                {
++                    if let Some((_, anchor)) = prompt {
++                        self.end_selection(cells);
++                        let index = self.resolve(cells, anchor);
++                        self.jump_to_entry(cells, index);
++                        self.last_click = None;
++                        return Some(ViewAction::Changed);
++                    }
++                    if self.toggle_disclosure_at(cells, event.column, event.row) {
++                        self.last_click = None;
++                        return Some(ViewAction::Changed);
++                    }
++                }
+                 // Open only a stationary click. Dragging back to the origin is still selection,
+                 // and wheel scrolling clears the pointer even when it cannot move the viewport.
+                 let link = if mode == MouseMode::Interactive {
+@@ -421,16 +442,10 @@ impl TranscriptView {
+         cells: &[Arc<dyn HistoryCell>],
+         mode: MouseMode,
+     ) -> Option<ViewAction> {
+-        if mode == MouseMode::Interactive
+-            && event.modifiers.is_empty()
+-            && self.toggle_disclosure_at(cells, event.column, event.row)
+-        {
+-            return Some(ViewAction::Changed);
+-        }
+         self.disclosure.focused = None;
+         let visible = self
+             .visible
+-            .get(usize::from(event.row.checked_sub(self.area.y)?))?;
++            .get(usize::from(event.row.saturating_sub(self.area.y)))?;
+         if mode == MouseMode::Interactive
+             && event
+                 .modifiers
 diff --git a/codex-rs/tui/src/transcript_view/layout.rs b/codex-rs/tui/src/transcript_view/layout.rs
-index 5e912a0..25f6f31 100644
+index 5e912a0..1fc1130 100644
 --- a/codex-rs/tui/src/transcript_view/layout.rs
 +++ b/codex-rs/tui/src/transcript_view/layout.rs
 @@ -10,7 +10,8 @@ use std::sync::Weak;
@@ -3535,7 +4428,15 @@ index 5e912a0..25f6f31 100644
  const MAX_CACHED_TEXT_BYTES: usize = 8 * 1024 * 1024;
  
  /// The selected activity presentation and any live content that follows it.
-@@ -35,6 +36,12 @@ pub(super) fn activity_layout(
+@@ -18,6 +19,7 @@ pub(crate) struct ActivityTranscriptLines {
+     pub(crate) activity: Vec<HyperlinkLine>,
+     pub(crate) auxiliary: Vec<HyperlinkLine>,
+     pub(crate) disclosure: Option<ActivityDisclosure>,
++    pub(crate) members: Vec<super::ActivityMember>,
+ }
+ 
+ /// Keep disclosure controls outside selectable source without rendering hidden details.
+@@ -35,6 +37,12 @@ pub(super) fn activity_layout(
      if !has_details {
          return layout;
      }
@@ -3548,24 +4449,29 @@ index 5e912a0..25f6f31 100644
      let label = match (expanded, lines.disclosure) {
          (true, _) => "− Show less".to_owned(),
          (false, Some(ActivityDisclosure::OutputLines(count))) => {
-@@ -79,6 +86,7 @@ struct CachedLayout {
+@@ -79,15 +87,20 @@ struct CachedLayout {
      layout: Arc<TextLayout>,
      rendered_frame: u64,
      animation_tick: Option<u64>,
 +    stable: bool,
  }
  
- #[derive(Clone, Copy, PartialEq, Eq)]
-@@ -88,6 +96,8 @@ pub(super) struct CellPresentation {
+-#[derive(Clone, Copy, PartialEq, Eq)]
++#[derive(Clone, PartialEq, Eq)]
+ pub(super) struct CellPresentation {
+     separated: bool,
+     turn_tip_space: bool,
      expanded: bool,
      disclosure: bool,
      detailed: bool,
 +    grouped: bool,
 +    summary: Option<crate::history_cell::ActivitySummary>,
++    expanded_members: Vec<bool>,
++    run_id: Option<String>,
  }
  
  impl TranscriptView {
-@@ -143,12 +153,20 @@ impl TranscriptView {
+@@ -143,12 +156,19 @@ impl TranscriptView {
          index: usize,
          full_content: bool,
      ) -> Option<Arc<TextLayout>> {
@@ -3580,15 +4486,14 @@ index 5e912a0..25f6f31 100644
              let live = self.live.as_ref()?;
 -            if cells.is_empty() || self.live_continuation {
 +            let joined_run = !full_content
-+                && self.compact_activity_run(cells, index).is_some_and(|run| {
-+                    run.head.is_some_and(|head| head < index)
-+                        && !self.disclosure.is_expanded(&run.ids)
-+                });
++                && self
++                    .compact_activity_run(cells, index)
++                    .is_some_and(|run| run.head.is_some_and(|head| head < index));
 +            if cells.is_empty() || self.live_continuation || joined_run {
                  return Some(Arc::clone(live));
              }
              let width = self.area.width.max(/*other*/ 1);
-@@ -157,6 +175,9 @@ impl TranscriptView {
+@@ -157,6 +177,9 @@ impl TranscriptView {
              })));
          };
          let width = self.area.width.max(/*other*/ 1);
@@ -3598,11 +4503,13 @@ index 5e912a0..25f6f31 100644
          // Session information belongs before all history, including pages not loaded yet.
          // Pinned displayed revisions above remain visible; hidden headers never enter the cache.
          if self.history.has_unloaded_history()
-@@ -165,27 +186,57 @@ impl TranscriptView {
+@@ -165,27 +188,89 @@ impl TranscriptView {
              return Some(Arc::new(TextLayout::new(Vec::new(), width)));
          }
          let mode = self.mode;
 -        let ids = cell.activity_ids();
+-        let disclosure = !self.detailed && mode == HistoryRenderMode::Rich && !ids.is_empty();
+-        let manually_expanded = self.disclosure.is_expanded(&ids);
 +        let run = (!full_content)
 +            .then(|| self.compact_activity_run(cells, index))
 +            .flatten();
@@ -3610,22 +4517,38 @@ index 5e912a0..25f6f31 100644
 +        let summary = run
 +            .filter(|run| run.head == Some(index))
 +            .map(|run| run.summary);
-+        let cell_ids = if grouped {
-+            Vec::new()
-+        } else {
-+            cell.activity_ids()
-+        };
-+        let ids = run.map_or(cell_ids.as_slice(), |run| run.ids.as_slice());
-         let disclosure = !self.detailed && mode == HistoryRenderMode::Rich && !ids.is_empty();
--        let manually_expanded = self.disclosure.is_expanded(&ids);
-+        let manually_expanded =
-+            run.map_or_else(|| self.disclosure.is_expanded(ids), |run| run.expanded);
++        let cell_ids = cell.activity_ids();
++        let disclosure =
++            !self.detailed && mode == HistoryRenderMode::Rich && (!cell_ids.is_empty() || grouped);
++        let manually_expanded = run.map_or_else(
++            || self.disclosure.is_expanded(&cell_ids),
++            |run| run.expanded,
++        );
          let expanded = disclosure && (full_content || manually_expanded);
 -        if manually_expanded {
 -            self.disclosure.expanded.extend(ids);
 +        let separated = index > 0
 +            && !cell.is_stream_continuation()
-+            && run.is_none_or(|run| run.head == Some(index) || expanded);
++            && run.is_none_or(|run| run.head == Some(index));
++        let run_id = run.map(|run| run.id.clone());
++        let member_ids = if grouped {
++            cell.activity_member_ids()
++                .into_iter()
++                .map(|ids| {
++                    if ids.is_empty() {
++                        vec![format!("activity:{:?}", EntryKey::cell(cell))]
++                    } else {
++                        ids
++                    }
++                })
++                .collect::<Vec<_>>()
++        } else {
++            Vec::new()
++        };
++        let expanded_members = member_ids
++            .iter()
++            .map(|ids| self.disclosure.is_expanded(ids))
++            .collect::<Vec<_>>();
 +        if manually_expanded && !grouped {
 +            self.disclosure.expanded.extend(cell_ids);
          }
@@ -3638,6 +4561,8 @@ index 5e912a0..25f6f31 100644
              detailed: full_content,
 +            grouped,
 +            summary,
++            expanded_members: expanded_members.clone(),
++            run_id: run_id.clone(),
          };
          let shortcut = self
              .disclosure
@@ -3645,24 +4570,45 @@ index 5e912a0..25f6f31 100644
              .primary_hint(KeymapContext::Global, "open_transcript");
          Some(self.cache.get(cell, width, presentation, || {
 -            if disclosure {
-+            if grouped && !expanded {
-+                let mut lines = summary.map_or_else(Vec::new, |summary| summary.lines(width));
-+                lines.extend(cell.running_activity_lines(width).into_iter().take(1));
-+                activity_layout(
-+                    ActivityTranscriptLines {
-+                        activity: lines,
-+                        auxiliary: Vec::new(),
-+                        disclosure: Some(ActivityDisclosure::Generic),
-+                    },
++            if grouped {
++                let members = if expanded {
++                    member_ids
++                        .into_iter()
++                        .zip(expanded_members)
++                        .map(|(ids, expanded)| {
++                            let lines = cell.activity_member_lines(width, &ids, expanded);
++                            super::ActivityMember { ids, lines }
++                        })
++                        .collect()
++                } else {
++                    let lines = cell
++                        .running_activity_lines(width)
++                        .into_iter()
++                        .take(1)
++                        .collect();
++                    vec![super::ActivityMember {
++                        ids: cell.activity_ids(),
++                        lines,
++                    }]
++                };
++                super::activity_runs::member_layout(
++                    summary.map(|summary| (summary, run_id.unwrap())),
++                    members,
 +                    width,
-+                    false,
-+                    shortcut,
 +                )
 +            } else if disclosure {
                  activity_layout(
                      ActivityTranscriptLines {
                          activity: if expanded {
-@@ -216,6 +267,10 @@ impl TranscriptView {
+@@ -194,6 +279,7 @@ impl TranscriptView {
+                             cell.compact_hyperlink_lines(width)
+                         },
+                         auxiliary: Vec::new(),
++                        members: Vec::new(),
+                         disclosure: cell.activity_disclosure(width),
+                     },
+                     width,
+@@ -216,6 +302,10 @@ impl TranscriptView {
  }
  
  impl LayoutCache {
@@ -3673,7 +4619,7 @@ index 5e912a0..25f6f31 100644
      pub(super) fn begin_frame(&mut self) {
          self.frame = self.frame.wrapping_add(/*rhs*/ 1);
          let state = RenderState {
-@@ -244,7 +299,8 @@ impl LayoutCache {
+@@ -244,7 +334,8 @@ impl LayoutCache {
                  && entry.presentation == presentation
                  && entry.source.ptr_eq(&source)
                  && (entry.rendered_frame == self.frame
@@ -3683,7 +4629,7 @@ index 5e912a0..25f6f31 100644
                          && entry.animation_tick == animation_tick))
          }) {
              let layout = Arc::clone(&self.entries[index].layout);
-@@ -273,6 +329,7 @@ impl LayoutCache {
+@@ -273,6 +364,7 @@ impl LayoutCache {
              layout: Arc::clone(&layout),
              rendered_frame: self.frame,
              animation_tick,
@@ -3692,19 +4638,21 @@ index 5e912a0..25f6f31 100644
          self.evict();
          layout
 diff --git a/codex-rs/tui/src/transcript_view/layout_tests.rs b/codex-rs/tui/src/transcript_view/layout_tests.rs
-index 486adc4..f59d153 100644
+index 486adc4..e742f54 100644
 --- a/codex-rs/tui/src/transcript_view/layout_tests.rs
 +++ b/codex-rs/tui/src/transcript_view/layout_tests.rs
-@@ -51,6 +51,8 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
+@@ -51,6 +51,10 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
                      expanded: false,
                      disclosure: false,
                      detailed: false,
 +                    grouped: false,
 +                    summary: None,
++                    expanded_members: Vec::new(),
++                    run_id: None,
                  },
                  || TextLayout::new(history.transcript_hyperlink_lines(width), width),
              )
-@@ -93,7 +95,8 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
+@@ -93,7 +97,8 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
  
  #[test]
  fn recent_entries_are_reused_and_old_entries_are_evicted() {
@@ -3714,16 +4662,18 @@ index 486adc4..f59d153 100644
      let mut cache = LayoutCache::default();
      cache.begin_frame();
      for cell in &cells {
-@@ -107,6 +110,8 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
+@@ -107,6 +112,10 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
                  expanded: false,
                  disclosure: false,
                  detailed: false,
 +                grouped: false,
 +                summary: None,
++                expanded_members: Vec::new(),
++                run_id: None,
              },
              || {
                  TextLayout::new(
-@@ -116,7 +121,7 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
+@@ -116,7 +125,7 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
              },
          );
      }
@@ -3732,16 +4682,18 @@ index 486adc4..f59d153 100644
          let history = cells[index].clone() as Arc<dyn HistoryCell>;
          cache.get(
              &history,
-@@ -127,6 +132,8 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
+@@ -127,6 +136,10 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
                  expanded: false,
                  disclosure: false,
                  detailed: false,
 +                grouped: false,
 +                summary: None,
++                expanded_members: Vec::new(),
++                run_id: None,
              },
              || {
                  TextLayout::new(
-@@ -137,7 +144,339 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
+@@ -137,7 +150,587 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
          );
      }
      assert_eq!(
@@ -3876,10 +4828,11 @@ index 486adc4..f59d153 100644
 +    let mut view = TranscriptView::default();
 +    view.sync_live_activity_summary(running.activity_summary());
 +    let expanded = view.sync_live_activity(&cells, running.activity_ids());
-+    view.sync_live_activity_tail(&cells, 80, None, expanded, |width| {
++    view.sync_live_activity_tail(&cells, 80, None, expanded, |width, _| {
 +        Some(ActivityTranscriptLines {
 +            activity: running.running_activity_lines(width),
 +            auxiliary: vec![],
++            members: Vec::new(),
 +            disclosure: running.activity_disclosure(width),
 +        })
 +    });
@@ -3889,10 +4842,11 @@ index 486adc4..f59d153 100644
 +    );
 +    let empty = [];
 +    let expanded = view.sync_live_activity(&empty, running.activity_ids());
-+    view.sync_live_activity_tail(&empty, 80, None, expanded, |width| {
++    view.sync_live_activity_tail(&empty, 80, None, expanded, |width, _| {
 +        Some(ActivityTranscriptLines {
 +            activity: running.running_activity_lines(width),
 +            auxiliary: vec![],
++            members: Vec::new(),
 +            disclosure: running.activity_disclosure(width),
 +        })
 +    });
@@ -3978,7 +4932,10 @@ index 486adc4..f59d153 100644
 +    let expanded = text(&render(&mut view, &cells, 80, 20));
 +    assert!(expanded.contains("echo one"), "{expanded}");
 +    assert!(expanded.contains("c.txt"), "{expanded}");
-+    assert!(!expanded.contains("1 command, 1 edit"), "{expanded}");
++    assert!(
++        expanded.starts_with("• 1 command, 1 edit\n• Ran echo one\n• Added c.txt (+1 -0)"),
++        "{expanded}"
++    );
 +    assert!(view.toggle_disclosure_at(&cells, 2, 0));
 +    assert_eq!(
 +        text(&render(&mut view, &cells, 80, 20)).trim_end(),
@@ -4047,10 +5004,11 @@ index 486adc4..f59d153 100644
 +            view.sync_live_activity_summary(running.activity_summary());
 +            let expanded = view.sync_live_activity(&cells, running.activity_ids());
 +            for width in [80, 60] {
-+                view.sync_live_activity_tail(&cells, width, None, expanded, |width| {
++                view.sync_live_activity_tail(&cells, width, None, expanded, |width, _| {
 +                    Some(ActivityTranscriptLines {
 +                        activity: running.running_activity_lines(width),
 +                        auxiliary: vec![],
++                        members: Vec::new(),
 +                        disclosure: running.activity_disclosure(width),
 +                    })
 +                });
@@ -4081,6 +5039,414 @@ index 486adc4..f59d153 100644
 +            }
 +        },
 +    );
++}
++
++fn compact_click(view: &mut TranscriptView, cells: &[Arc<dyn HistoryCell>], row: u16) {
++    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
++    for kind in [
++        MouseEventKind::Down(MouseButton::Left),
++        MouseEventKind::Up(MouseButton::Left),
++    ] {
++        assert!(
++            view.handle_mouse(
++                MouseEvent {
++                    kind,
++                    column: 4,
++                    row,
++                    modifiers: KeyModifiers::NONE
++                },
++                cells
++            )
++            .is_some()
++        );
++    }
++}
++
++#[test]
++fn compact_main_view_fullscreen_two_level_disclosure() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
++    let mut reads = compact_exec("a", "cat a.rs", Agent, true);
++    reads
++        .append_completed(compact_exec("b", "cat b.rs", Agent, true))
++        .unwrap();
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![
++        Arc::new(reads),
++        Arc::new(compact_exec("one", "echo one", Agent, true)),
++        compact_patch(),
++    ];
++    let mut view = TranscriptView::default();
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 24)).trim_end(),
++        "• 1 command, 1 edit, 2 reads"
++    );
++    compact_click(&mut view, &cells, 0);
++    let level_one = "• 1 command, 1 edit, 2 reads\n• Read a.rs\n• Read b.rs\n• Ran echo one\n• Added c.txt (+1 -0)";
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 24)).trim_end(),
++        level_one
++    );
++    compact_click(&mut view, &cells, 2);
++    let details = text(&render(&mut view, &cells, 80, 24));
++    assert!(details.contains("$ cat b.rs\nretained output"), "{details}");
++    assert!(
++        details.starts_with("• 1 command, 1 edit, 2 reads\n• Read a.rs\n"),
++        "{details}"
++    );
++    for (kind, column) in [
++        (MouseEventKind::Down(MouseButton::Left), 0),
++        (MouseEventKind::Drag(MouseButton::Left), 8),
++        (MouseEventKind::Up(MouseButton::Left), 8),
++    ] {
++        view.handle_mouse(
++            MouseEvent {
++                kind,
++                column,
++                row: 3,
++                modifiers: KeyModifiers::NONE,
++            },
++            &cells,
++        );
++    }
++    assert_eq!(view.selected_text(&cells).as_deref(), Some("retained"));
++    assert_eq!(text(&render(&mut view, &cells, 80, 24)), details);
++    compact_click(&mut view, &cells, 3);
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 24)).trim_end(),
++        level_one
++    );
++    compact_click(&mut view, &cells, 4);
++    assert!(text(&render(&mut view, &cells, 80, 24)).contains("body"));
++    compact_click(&mut view, &cells, 0);
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 24)).trim_end(),
++        "• 1 command, 1 edit, 2 reads"
++    );
++    compact_click(&mut view, &cells, 0);
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 24)).trim_end(),
++        level_one
++    );
++}
++
++#[test]
++fn compact_main_view_fullscreen_collapse_keeps_clicked_member_on_screen() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    let mut command = compact_exec("long", "echo long", Agent, true);
++    command.complete_call(
++        "long",
++        crate::exec_cell::CommandOutput::new(
++            0,
++            (0..100).map(|n| format!("output {n}\n")).collect(),
++        ),
++        std::time::Duration::ZERO,
++    );
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![
++        Arc::new(crate::history_cell::PlainHistoryCell::new(
++            (0..40).map(|n| format!("context {n}").into()).collect(),
++        )),
++        Arc::new(command),
++        Arc::new(compact_exec("next", "echo next", Agent, true)),
++        Arc::new(crate::history_cell::PlainHistoryCell::new(vec![
++            "answer"
++                .into();
++            6
++        ])),
++    ];
++    let mut view = TranscriptView::default();
++    let initial = text(&render(&mut view, &cells, 80, 16));
++    let summary_row = initial
++        .lines()
++        .position(|row| row == "• 2 commands")
++        .unwrap() as u16;
++    compact_click(&mut view, &cells, summary_row);
++    render(&mut view, &cells, 80, 16);
++    compact_click(&mut view, &cells, summary_row + 1);
++    render(&mut view, &cells, 80, 16);
++    view.scroll(&cells, 20);
++    let detail = text(&render(&mut view, &cells, 80, 16));
++    assert!(
++        detail.lines().nth(6).unwrap().starts_with("output "),
++        "{detail}"
++    );
++    compact_click(&mut view, &cells, 6);
++    let collapsed = text(&render(&mut view, &cells, 80, 16));
++    assert_eq!(collapsed.lines().nth(6), Some("• Ran echo long"));
++    assert_eq!(collapsed.lines().nth(5), Some("• 2 commands"));
++    compact_click(&mut view, &cells, 5);
++    let collapsed = text(&render(&mut view, &cells, 80, 16));
++    assert_eq!(collapsed.lines().nth(5), Some("• 2 commands"));
++    assert!(!collapsed.contains("Ran echo"), "{collapsed}");
++}
++
++#[test]
++fn compact_main_view_fullscreen_keyboard_disclosure_levels() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![
++        Arc::new(compact_exec("one", "echo one", Agent, true)),
++        compact_patch(),
++    ];
++    let mut view = TranscriptView::default();
++    render(&mut view, &cells, 80, 24);
++    for (keys, expected) in [
++        (
++            vec![KeyCode::F(4), KeyCode::Enter],
++            "• 1 command, 1 edit\n• Ran echo one\n• Added c.txt (+1 -0)",
++        ),
++        (
++            vec![KeyCode::Down, KeyCode::Enter],
++            "$ echo one\nretained output",
++        ),
++        (
++            vec![KeyCode::Enter],
++            "• 1 command, 1 edit\n• Ran echo one\n• Added c.txt (+1 -0)",
++        ),
++        (vec![KeyCode::Right], "$ echo one\nretained output"),
++        (
++            vec![KeyCode::Left],
++            "• 1 command, 1 edit\n• Ran echo one\n• Added c.txt (+1 -0)",
++        ),
++        (vec![KeyCode::Home, KeyCode::Left], "• 1 command, 1 edit"),
++    ] {
++        for key in keys {
++            assert!(
++                view.handle_key(KeyEvent::new(key, KeyModifiers::NONE), &cells)
++                    .is_some()
++            );
++            render(&mut view, &cells, 80, 24);
++        }
++        let rendered = text(&render(&mut view, &cells, 80, 24));
++        if expected.starts_with('$') {
++            assert!(rendered.contains(expected), "{rendered}");
++        } else {
++            assert_eq!(rendered.trim_end(), expected);
++        }
++    }
++}
++
++#[test]
++fn compact_main_view_fullscreen_computer_calls_disclose_individually() {
++    use crate::history_cell::{ComputerActivityCell, McpInvocation, McpToolCallCell};
++    use crate::transcript_view::tests::{render, text};
++    let mut computer = ComputerActivityCell::default();
++    for (id, title, output) in [
++        ("inspect", "Inspect page", "page details"),
++        ("click", "Click button", "button details"),
++    ] {
++        computer.complete(
++            McpToolCallCell::new(
++                id.into(),
++                McpInvocation {
++                    server: "cua_repl".into(),
++                    tool: "js".into(),
++                    arguments: Some(serde_json::json!({"title": title, "code": "run()"})),
++                },
++                false,
++            ),
++            std::time::Duration::ZERO,
++            Ok(codex_protocol::mcp::CallToolResult {
++                content: vec![serde_json::json!({"type": "text", "text": output})],
++                structured_content: None,
++                is_error: Some(false),
++                meta: None,
++            }),
++        );
++    }
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![Arc::new(computer)];
++    let mut view = TranscriptView::default();
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 20)).trim_end(),
++        "• 2 tools"
++    );
++    compact_click(&mut view, &cells, 0);
++    let level_one = "• 2 tools\n• Called Inspect page\n• Called Click button";
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 20)).trim_end(),
++        level_one
++    );
++    compact_click(&mut view, &cells, 1);
++    let details = text(&render(&mut view, &cells, 80, 20));
++    assert!(details.contains("page details"), "{details}");
++    assert!(!details.contains("button details"), "{details}");
++    let row = details
++        .lines()
++        .position(|line| line.contains("page details"))
++        .unwrap() as u16;
++    compact_click(&mut view, &cells, row);
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 20)).trim_end(),
++        level_one
++    );
++}
+diff --git a/codex-rs/tui/src/transcript_view/prompt_header.rs b/codex-rs/tui/src/transcript_view/prompt_header.rs
+index b2d6953..959ef69 100644
+--- a/codex-rs/tui/src/transcript_view/prompt_header.rs
++++ b/codex-rs/tui/src/transcript_view/prompt_header.rs
+@@ -19,7 +19,7 @@ pub(super) fn line(
+     cells: &[Arc<dyn HistoryCell>],
+     first: usize,
+     width: u16,
+-) -> Option<Line<'static>> {
++) -> Option<(usize, Line<'static>)> {
+     // A prompt that is still visible supplies its own context. Only pin a preceding prompt.
+     if width < 16
+         || cells
+@@ -29,11 +29,16 @@ pub(super) fn line(
+     {
+         return None;
+     }
+-    let prompt = cells[..first.min(cells.len())]
++    let (index, prompt) = cells[..first.min(cells.len())]
+         .iter()
++        .enumerate()
+         .rev()
+-        .filter_map(|cell| cell.as_any().downcast_ref::<UserHistoryCell>())
+-        .find(|prompt| prompt.has_visible_content())?;
++        .filter_map(|(index, cell)| {
++            cell.as_any()
++                .downcast_ref::<UserHistoryCell>()
++                .map(|prompt| (index, prompt))
++        })
++        .find(|(_, prompt)| prompt.has_visible_content())?;
+     // Bound work even for pasted multi-megabyte prompts; sanitize before painting controls.
+     let prefix: String = prompt.message.chars().take(/*n*/ 512).collect();
+     let message = sanitize_user_text(prefix.into())
+@@ -45,7 +50,7 @@ pub(super) fn line(
+     } else {
+         message
+     };
+-    Some(truncate_line_with_ellipsis_if_overflow(
++    let line = truncate_line_with_ellipsis_if_overflow(
+         Line::from(vec![
+             if prompt.spoken {
+                 "› ".red().bold()
+@@ -56,7 +61,8 @@ pub(super) fn line(
+         ])
+         .style(crate::style::history_prompt_style()),
+         usize::from(width.saturating_sub(1)),
+-    ))
++    );
++    Some((index, line))
+ }
+ 
+ #[cfg(test)]
+diff --git a/codex-rs/tui/src/transcript_view/prompt_header_tests.rs b/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
+index 3915436..f8ace64 100644
+--- a/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
++++ b/codex-rs/tui/src/transcript_view/prompt_header_tests.rs
+@@ -80,7 +80,7 @@ fn prompt_header_tracks_reading_and_yields_to_visible_prompts_and_short_screens(
+ #[test]
+ fn header_sanitizes_controls_and_truncates_by_display_width() {
+     let cells = vec![user("\x1b[31m界 café\r\nnext question"), cell("answer")];
+-    let line = line(&cells, /*first*/ 1, /*width*/ 18).unwrap();
++    let (_, line) = line(&cells, /*first*/ 1, /*width*/ 18).unwrap();
+     assert!(line.width() <= 18);
+     insta::assert_snapshot!(line.to_string());
+ }
+@@ -246,3 +246,100 @@ fn paused_header_reservation_survives_copy_until_scroll_or_resize() {
+         assert_eq!(view.area.y, 1);
+     }
+ }
++
++#[test]
++fn compact_main_view_prompt_header_click_jumps_to_its_user_cell() {
++    for prepend in [false, true] {
++        let mut cells = vec![
++            user("First question"),
++            cell("Earlier answer"),
++            user("Second question\nwith details"),
++            cell(
++                (1..=40)
++                    .map(|n| format!("answer line {n:02}"))
++                    .collect::<Vec<_>>()
++                    .join("\n"),
++            ),
++        ];
++        let mut view = TranscriptView::default();
++        let before = render(&mut view, &cells, 40, 8);
++        assert!(text(&before).starts_with("› Second question with details\nanswer line 34"));
++        let down = MouseEvent {
++            kind: MouseEventKind::Down(MouseButton::Left),
++            column: 5,
++            row: 0,
++            modifiers: KeyModifiers::NONE,
++        };
++        assert!(view.handle_mouse(down, &cells).is_some());
++        assert_eq!(render(&mut view, &cells, 40, 8), before);
++        if prepend {
++            cells.insert(0, cell("Older history"));
++            view.history_loaded(&cells, 0..1);
++            assert_eq!(render(&mut view, &cells, 40, 8), before);
++        }
++        assert!(
++            view.handle_mouse(
++                MouseEvent {
++                    kind: MouseEventKind::Up(MouseButton::Left),
++                    ..down
++                },
++                &cells
++            )
++            .is_some()
++        );
++        assert_eq!(
++            text(&render(&mut view, &cells, 40, 8)).trim_end(),
++            "\n› Second question\n  with details\n\n\nanswer line 01\nanswer line 02\nanswer line 03"
++        );
++        assert!(!view.is_following());
++        assert!(view.selected_text(&cells).is_none());
++    }
++}
++
++#[test]
++fn compact_main_view_prompt_header_drag_selects_without_jumping() {
++    let cells = vec![
++        user("Question"),
++        cell(
++            (1..=40)
++                .map(|n| format!("answer line {n:02}"))
++                .collect::<Vec<_>>()
++                .join("\n"),
++        ),
++    ];
++    for (start_row, end_row) in [(0, 1), (1, 0)] {
++        let mut view = TranscriptView::default();
++        let before = render(&mut view, &cells, 40, 8);
++        let down = MouseEvent {
++            kind: MouseEventKind::Down(MouseButton::Left),
++            column: 2,
++            row: start_row,
++            modifiers: KeyModifiers::NONE,
++        };
++        view.handle_mouse(down, &cells);
++        assert_eq!(render(&mut view, &cells, 40, 8), before);
++        for kind in [
++            MouseEventKind::Drag(MouseButton::Left),
++            MouseEventKind::Up(MouseButton::Left),
++        ] {
++            view.handle_mouse(
++                MouseEvent {
++                    kind,
++                    column: 6,
++                    row: end_row,
++                    ..down
++                },
++                &cells,
++            );
++            assert_eq!(text(&render(&mut view, &cells, 40, 8)), text(&before));
++        }
++        assert_eq!(view.selected_text(&cells).as_deref(), Some("swer"));
++        let Some(ViewAction::Copy(copied)) = view.handle_key(
++            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
++            &cells,
++        ) else {
++            panic!("copy header drag");
++        };
++        assert_eq!(copied, "swer");
++    }
 +}
 diff --git a/codex-rs/tui/src/transcript_view/snapshots/codex_tui__transcript_view__copy_mode__tests__copy_resize_keeps_whole_user_padding_inside_context.snap b/codex-rs/tui/src/transcript_view/snapshots/codex_tui__transcript_view__copy_mode__tests__copy_resize_keeps_whole_user_padding_inside_context.snap
 index d321332..c9a7982 100644
@@ -4114,11 +5480,81 @@ index 12a29bf..71419e8 100644
  expression: "snapshots.join(\"\\n\\n\")"
  ---
  Latest
+diff --git a/codex-rs/tui/src/transcript_view/text.rs b/codex-rs/tui/src/transcript_view/text.rs
+index 282925d..fe67f24 100644
+--- a/codex-rs/tui/src/transcript_view/text.rs
++++ b/codex-rs/tui/src/transcript_view/text.rs
+@@ -49,6 +49,13 @@ pub(super) struct TextLayout {
+     pub(super) separated: bool,
+     pub(super) disclosure: bool,
+     disclosure_control: Option<DisclosureControl>,
++    pub(super) activity_regions: Vec<ActivityRegion>,
++}
++
++#[derive(Clone)]
++pub(super) struct ActivityRegion {
++    pub(super) source: Range<usize>,
++    pub(super) ids: Vec<String>,
+ }
+ 
+ struct DisclosureControl {
+@@ -137,6 +144,8 @@ impl TextLayout {
+             layout =
+                 layout.with_disclosure_control_at(control.label.clone(), control.source_offset);
+         }
++        layout.activity_regions = self.activity_regions.clone();
++        layout.disclosure |= !layout.activity_regions.is_empty();
+         if self.separated {
+             layout.with_leading_separator()
+         } else {
+@@ -144,6 +153,16 @@ impl TextLayout {
+         }
+     }
+ 
++    pub(super) fn activity_region(&self, row: usize) -> Option<&ActivityRegion> {
++        if self.separated && row == 0 {
++            return None;
++        }
++        let offset = self.rows.get(row)?.source.start;
++        self.activity_regions
++            .iter()
++            .find(|region| region.source.contains(&offset))
++    }
++
+     /// Append a clipped interaction row outside the copied and searched source text.
+     pub(super) fn with_disclosure_control(self, label: String) -> Self {
+         let source_offset = self.text.len();
+@@ -455,6 +474,7 @@ impl TextLayout {
+             separated: false,
+             disclosure: false,
+             disclosure_control: None,
++            activity_regions: Vec::new(),
+         }
+     }
+ }
 diff --git a/codex-rs/tui/src/transcript_view_tests.rs b/codex-rs/tui/src/transcript_view_tests.rs
-index 92b3eb1..e7d0e38 100644
+index 92b3eb1..4b81487 100644
 --- a/codex-rs/tui/src/transcript_view_tests.rs
 +++ b/codex-rs/tui/src/transcript_view_tests.rs
-@@ -158,6 +158,7 @@ fn terminal_output_disclosure_follows_live_history_and_keymap() {
+@@ -38,7 +38,7 @@ pub(super) fn cell(text: impl Into<String>) -> Arc<dyn HistoryCell> {
+     })
+ }
+ 
+-pub(super) fn render(
++pub(crate) fn render(
+     view: &mut TranscriptView,
+     cells: &[Arc<dyn HistoryCell>],
+     width: u16,
+@@ -50,7 +50,7 @@ pub(super) fn render(
+     buffer
+ }
+ 
+-pub(super) fn text(buffer: &Buffer) -> String {
++pub(crate) fn text(buffer: &Buffer) -> String {
+     (buffer.area.top()..buffer.area.bottom())
+         .map(|y| {
+             (buffer.area.left()..buffer.area.right())
+@@ -158,13 +158,15 @@ fn terminal_output_disclosure_follows_live_history_and_keymap() {
      let mut view = TranscriptView::default();
      view.sync_live_activity(&[], cell.activity_ids());
      view.sync_live_activity_tail(
@@ -4126,3 +5562,12 @@ index 92b3eb1..e7d0e38 100644
          /*width*/ 72,
          /*key*/ None,
          /*expanded*/ false,
+-        |width| {
++        |width, _| {
+             Some(ActivityTranscriptLines {
+                 activity: cell.compact_hyperlink_lines(width),
+                 auxiliary: Vec::new(),
++                members: Vec::new(),
+                 disclosure: cell.activity_disclosure(width),
+             })
+         },
