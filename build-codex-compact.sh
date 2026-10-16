@@ -171,7 +171,8 @@ text = re.sub(r'(?m)(^name = "[^"]+"\nversion = ")0\.0\.0("\n)(?!source =)', lam
 open(path, "w").write(text)
 EOF
     # Official Linux builds embed LF migration bytes in their SQLx checksums, which matches the checkout.
-    run git -C "$source" diff --check HEAD
+    # Snapshots record rendered padding, so trailing spaces there are expected.
+    run git -C "$source" diff --check HEAD -- . ':!*.snap'
     run git -C "$source" diff --binary "--output=$source_patch" HEAD
     printf '{"sourceCommit": "%s", "patchSha256": "%s"}\n' "$(git -C "$source" rev-parse HEAD)" "$(sha "$source_patch")" >"$prepared"
 else

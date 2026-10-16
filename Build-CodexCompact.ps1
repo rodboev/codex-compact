@@ -196,7 +196,7 @@ try {
             $sql = [IO.File]::ReadAllText($file.FullName).Replace("`r`n", "`n").Replace("`n", "`r`n")
             [IO.File]::WriteAllText($file.FullName, $sql)
         }
-        Invoke-Native -Executable git -Arguments @('-C', $source, 'diff', '--check', 'HEAD')
+        Invoke-Native -Executable git -Arguments @('-C', $source, 'diff', '--check', 'HEAD', '--', '.', ':!*.snap')
         Invoke-Native -Executable git -Arguments @('-C', $source, 'diff', '--binary', "--output=$sourcePatch", 'HEAD')
         @{ sourceCommit = (& git -C $source rev-parse HEAD).Trim(); patchSha256 = (Get-FileHash -LiteralPath $sourcePatch).Hash } | ConvertTo-Json | Set-Content -LiteralPath $prepared -Encoding utf8
     } else {
