@@ -1,3 +1,15 @@
+diff --git a/codex-rs/tui/src/app.rs b/codex-rs/tui/src/app.rs
+index 5dfc3ad..de91358 100644
+--- a/codex-rs/tui/src/app.rs
++++ b/codex-rs/tui/src/app.rs
+@@ -565,6 +565,7 @@ pub(crate) struct App {
+     pub(crate) retained_analytics: Option<Box<crate::analytics::AnalyticsView>>,
+     pub(crate) deferred_history_lines: Vec<crate::terminal_hyperlinks::HyperlinkLine>,
+     has_emitted_history_lines: bool,
++    last_history_activity: Option<history_cell::ActivityRowKind>,
+     transcript_reflow: TranscriptReflowState,
+     initial_history_replay_buffer: Option<InitialHistoryReplayBuffer>,
+     pending_thread_switch_resets: usize,
 diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
 index 2979e0a..f8a8230 100644
 --- a/codex-rs/tui/src/app/event_dispatch.rs
@@ -106,24 +118,6 @@ index dcacf8d..bff1a23 100644
          self.transcript_reflow.clear();
          self.chat_widget.clear_pending_rate_limit_reset_hint();
          self.initial_history_replay_buffer = None;
-diff --git a/codex-rs/tui/src/app/input.rs b/codex-rs/tui/src/app/input.rs
-index 2a8938d..2273693 100644
---- a/codex-rs/tui/src/app/input.rs
-+++ b/codex-rs/tui/src/app/input.rs
-@@ -569,8 +569,12 @@ impl App {
-                 .chat_widget
-                 .thread_id()
-                 .is_some_and(|thread_id| app_server.has_older_history(thread_id));
-+            if !find_transcript {
-+                self.open_file_edits_transcript_overlay(tui);
-+                return;
-+            }
-             self.open_transcript_overlay(tui);
--            if find_transcript && let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
-+            if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
-                 overlay.set_keymap_bindings(&self.keymap);
-                 overlay.begin_search();
-             }
 diff --git a/codex-rs/tui/src/app/native_history.rs b/codex-rs/tui/src/app/native_history.rs
 index b34523e..89bad4d 100644
 --- a/codex-rs/tui/src/app/native_history.rs
@@ -188,18 +182,19 @@ index b34523e..89bad4d 100644
              .native_history
              .pending
 diff --git a/codex-rs/tui/src/app/owned_transcript.rs b/codex-rs/tui/src/app/owned_transcript.rs
-index 3fcd0cd..4401469 100644
+index 3fcd0cd..731ad9a 100644
 --- a/codex-rs/tui/src/app/owned_transcript.rs
 +++ b/codex-rs/tui/src/app/owned_transcript.rs
-@@ -52,6 +52,7 @@ impl App {
+@@ -52,6 +52,8 @@ impl App {
          view.set_presentation(view.is_detailed(), chat_widget.history_render_mode());
          let active_key = chat_widget.active_cell_transcript_key();
          let detailed = view.is_detailed();
 +        view.sync_live_activity_summary(chat_widget.active_activity_summary());
++        view.sync_live_activity_row_kind(chat_widget.active_activity_row_kind());
          let active_ids = chat_widget.active_activity_ids();
          let expanded = view.sync_live_activity(&self.transcript_cells, active_ids)
              && chat_widget.history_render_mode() == HistoryRenderMode::Rich;
-@@ -63,9 +64,15 @@ impl App {
+@@ -63,9 +65,15 @@ impl App {
                  chat_widget.active_cell_transcript_hyperlink_lines(width)
              })
          } else {
@@ -219,7 +214,7 @@ index 3fcd0cd..4401469 100644
          changed || search_changed
      }
 diff --git a/codex-rs/tui/src/app/resize_reflow.rs b/codex-rs/tui/src/app/resize_reflow.rs
-index 632ac8b..2be06c7 100644
+index 632ac8b..106cf4c 100644
 --- a/codex-rs/tui/src/app/resize_reflow.rs
 +++ b/codex-rs/tui/src/app/resize_reflow.rs
 @@ -45,11 +45,6 @@ impl From<ratatui::layout::Size> for TerminalWidth {
@@ -234,16 +229,17 @@ index 632ac8b..2be06c7 100644
  /// Rendered transcript lines ready to be replayed into terminal scrollback.
  ///
  /// This is intentionally line-oriented rather than cell-oriented because the terminal only accepts
-@@ -83,6 +78,8 @@ pub(super) fn trailing_run_start<T: 'static>(transcript_cells: &[Arc<dyn History
+@@ -83,6 +78,9 @@ pub(super) fn trailing_run_start<T: 'static>(transcript_cells: &[Arc<dyn History
  impl App {
      pub(super) fn reset_history_emission_state(&mut self) {
          self.has_emitted_history_lines = false;
++        self.last_history_activity = None;
 +        self.chat_widget.set_history_activity(Default::default());
 +        self.chat_widget.set_deferred_activity(Vec::new());
          self.deferred_history_lines.clear();
          self.last_rendered_history_tail = None;
      }
-@@ -92,15 +89,14 @@ impl App {
+@@ -92,14 +90,26 @@ impl App {
          cell: &dyn HistoryCell,
          width: u16,
      ) -> Vec<HyperlinkLine> {
@@ -255,19 +251,30 @@ index 632ac8b..2be06c7 100644
 -            } else {
 -                self.has_emitted_history_lines = true;
 -            }
--        }
-+        let continuation =
++        let mut continuation =
 +            cell.is_stream_continuation() && !self.chat_widget.has_history_activity();
++        let kind = cell.activity_row_kind();
++        let leading_kind = if self.chat_widget.has_history_activity() {
++            Some(history_cell::ActivityRowKind::Tool)
++        } else {
++            kind
++        };
++        if self.chat_widget.history_render_mode() == history_cell::HistoryRenderMode::Rich {
++            continuation |=
++                leading_kind.is_some_and(|kind| kind.stacks_with(self.last_history_activity));
++        }
 +        let mut display = self.chat_widget.render_history_activity(cell, width);
 +        history_separator(
 +            &mut display,
 +            continuation,
 +            &mut self.has_emitted_history_lines,
 +        );
++        if !display.is_empty() || cell.as_any().is::<history_cell::FinalMessageSeparator>() {
++            self.last_history_activity = kind;
+         }
          display
      }
- 
-@@ -652,59 +648,57 @@ impl App {
+@@ -652,59 +662,69 @@ impl App {
      /// so the returned rows obey the cap exactly.
      pub(super) fn render_transcript_lines_for_reflow(&mut self, width: u16) -> ReflowRenderResult {
          let row_cap = self.resize_reflow_max_rows();
@@ -333,6 +340,7 @@ index 632ac8b..2be06c7 100644
          }
  
          let mut has_emitted_history_lines = false;
++        let mut last_history_activity = None;
 +        let mut summary = history_cell::ActivitySummary::default();
          let mut reflowed_lines = Vec::new();
 -        for display in cell_displays {
@@ -342,21 +350,38 @@ index 632ac8b..2be06c7 100644
 -                } else {
 -                    has_emitted_history_lines = true;
 -                }
--            }
--            reflowed_lines.extend(display.lines);
--        }
 +        for cell in &self.native_history.replayable_cells(&self.transcript_cells)[start..] {
-+            let continuation = cell.is_stream_continuation() && summary.is_empty();
++            let kind = cell.activity_row_kind();
++            let leading_kind = if summary.is_empty() {
++                kind
++            } else {
++                Some(history_cell::ActivityRowKind::Tool)
++            };
++            let continuation = (cell.is_stream_continuation() && summary.is_empty())
++                || (mode == history_cell::HistoryRenderMode::Rich
++                    && leading_kind.is_some_and(|kind| kind.stacks_with(last_history_activity)));
 +            let mut lines = summary.render_cell(cell.as_ref(), width, mode);
 +            history_separator(&mut lines, continuation, &mut has_emitted_history_lines);
++            if !lines.is_empty() || cell.as_any().is::<history_cell::FinalMessageSeparator>() {
++                last_history_activity = kind;
+             }
+-            reflowed_lines.extend(display.lines);
 +            reflowed_lines.extend(lines);
-+        }
+         }
 +        self.chat_widget.set_history_activity(summary);
 +        self.sync_native_history_activity(width);
          if let Some(max_rows) = row_cap
              && reflowed_lines.len() > max_rows
          {
-@@ -769,3 +763,17 @@ impl App {
+@@ -714,6 +734,7 @@ impl App {
+         }
+         self.prepend_scrollback_history_notice(&mut reflowed_lines, history_was_truncated, width);
+         self.has_emitted_history_lines = !reflowed_lines.is_empty();
++        self.last_history_activity = last_history_activity;
+ 
+         ReflowRenderResult {
+             lines: reflowed_lines,
+@@ -769,3 +790,17 @@ impl App {
  #[cfg(test)]
  #[path = "resize_reflow_tests.rs"]
  mod tests;
@@ -375,7 +400,7 @@ index 632ac8b..2be06c7 100644
 +    *has_emitted = true;
 +}
 diff --git a/codex-rs/tui/src/app/resize_reflow_tests.rs b/codex-rs/tui/src/app/resize_reflow_tests.rs
-index d1cf18a..d7bb656 100644
+index d1cf18a..48df262 100644
 --- a/codex-rs/tui/src/app/resize_reflow_tests.rs
 +++ b/codex-rs/tui/src/app/resize_reflow_tests.rs
 @@ -1,6 +1,7 @@
@@ -386,14 +411,15 @@ index d1cf18a..d7bb656 100644
  use pretty_assertions::assert_eq;
  
  fn plain_history_cells(count: usize) -> Vec<Arc<dyn HistoryCell>> {
-@@ -268,3 +269,1043 @@ async fn scrollback_refill_only_loads_older_pages_for_an_underfilled_row_cap() {
+@@ -268,3 +269,1133 @@ async fn scrollback_refill_only_loads_older_pages_for_an_underfilled_row_cap() {
      app.local_settings.tui.terminal_resize_reflow_max_rows = Some(0);
      assert!(!app.scrollback_history_needs_top_up(/*rendered_rows*/ 31));
  }
 +
 +fn compact_command(id: &str, command: &str) -> crate::exec_cell::ExecCell {
 +    let command = vec!["bash".into(), "-lc".into(), command.into()];
-+    let parsed = codex_shell_command::parse_command::parse_command(&command);
++    let mut parsed = codex_shell_command::parse_command::parse_command(&command);
++    crate::exec_command::resolve_read_paths(&mut parsed, std::path::Path::new("/repo"));
 +    let mut cell = crate::exec_cell::new_active_exec_command(
 +        id.into(),
 +        command,
@@ -614,9 +640,7 @@ index d1cf18a..d7bb656 100644
 +    );
 +    insta::assert_snapshot!(compact_buffer_text(&app), @"
 +    • 1 read
-+
-+    • Read SKILL.md
-+
++    • Read /repo/SKILL.md
 +    • 1 read
 +
 +    • You ran echo hello
@@ -624,6 +648,97 @@ index d1cf18a..d7bb656 100644
 +
 +    • 1 edit
 +    ");
++    let before = compact_buffer_text(&app);
++    let reflowed = app
++        .render_transcript_lines_for_reflow(80)
++        .lines
++        .iter()
++        .map(rendered_line_text)
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert_eq!(reflowed, before);
++    Ok(())
++}
++
++#[tokio::test]
++async fn compact_main_view_inline_skill_paths_deduplicate_reads() -> Result<()> {
++    let mut app = make_test_app().await;
++    app.local_settings.tui.terminal_resize_reflow_max_rows = Some(128);
++    app.begin_initial_history_replay_buffer();
++    let mut tui = crate::tui::test_support::make_test_tui()?;
++    for (id, command) in [
++        ("before", "pwd"),
++        (
++            "skills",
++            "cat alpha/SKILL.md; sed -n '1,200p' beta/SKILL.md; sed -n '200,400p' beta/../beta/SKILL.md",
++        ),
++        ("after", "pwd"),
++    ] {
++        app.insert_history_cell(&mut tui, Box::new(compact_command(id, command)));
++    }
++    app.insert_history_cell(
++        &mut tui,
++        Box::new(history_cell::FinalMessageSeparator::new(None, None)),
++    );
++    assert_eq!(
++        compact_buffer_text(&app),
++        "• 1 command\n• Read /repo/alpha/SKILL.md\n• Read /repo/beta/SKILL.md\n• 1 command"
++    );
++    let reflowed = app
++        .render_transcript_lines_for_reflow(80)
++        .lines
++        .iter()
++        .map(rendered_line_text)
++        .collect::<Vec<_>>()
++        .join("\n");
++    assert_eq!(
++        reflowed,
++        "• 1 command\n• Read /repo/alpha/SKILL.md\n• Read /repo/beta/SKILL.md\n• 1 command"
++    );
++    Ok(())
++}
++
++#[tokio::test]
++async fn compact_main_view_ctrl_t_preserves_skill_command_and_output() -> Result<()> {
++    use crate::app::owned_transcript::tests::buffer_text;
++    use crate::pager_overlay::Overlay;
++    use crate::tui::TuiEvent;
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    for owned in [true, false] {
++        let mut app = make_test_app().await;
++        app.transcript_cells = vec![std::sync::Arc::new(compact_command(
++            "skill",
++            "cat demo/SKILL.md",
++        ))];
++        let mut server = Box::pin(crate::start_embedded_app_server_for_picker(&app.config)).await?;
++        let mut tui = crate::tui::test_support::make_test_tui()?;
++        tui.set_owned_screen(owned)?;
++        app.handle_tui_event(
++            &mut tui,
++            &mut server,
++            TuiEvent::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
++        )
++        .await?;
++        let rendered = if owned {
++            app.render_owned_transcript(&mut tui, Size::new(80, 24))?;
++            buffer_text(crate::custom_terminal::test_support::last_rendered_buffer(
++                &tui.terminal,
++            ))
++        } else {
++            let Some(Overlay::Transcript(overlay)) = app.overlay.as_mut() else {
++                panic!("expected full transcript");
++            };
++            let area = ratatui::layout::Rect::new(0, 0, 80, 24);
++            let mut buffer = ratatui::buffer::Buffer::empty(area);
++            overlay.render(area, &mut buffer);
++            buffer_text(&buffer)
++        };
++        assert!(rendered.contains("$ cat demo/SKILL.md"), "{rendered}");
++        assert!(rendered.contains("retained output"), "{rendered}");
++        app.close_transcript_overlay(&mut tui);
++        tui.set_owned_screen(false)?;
++        server.shutdown().await?;
++    }
 +    Ok(())
 +}
 +
@@ -1430,6 +1545,50 @@ index d1cf18a..d7bb656 100644
 +    );
 +    Ok(())
 +}
+diff --git a/codex-rs/tui/src/app/startup.rs b/codex-rs/tui/src/app/startup.rs
+index 69a4ff5..a534b0a 100644
+--- a/codex-rs/tui/src/app/startup.rs
++++ b/codex-rs/tui/src/app/startup.rs
+@@ -900,6 +900,7 @@ See the Codex keymap documentation for supported actions and examples."
+             retained_analytics: None,
+             deferred_history_lines: Vec::new(),
+             has_emitted_history_lines: false,
++            last_history_activity: None,
+             transcript_reflow: TranscriptReflowState::default(),
+             initial_history_replay_buffer: None,
+             pending_thread_switch_resets: 0,
+diff --git a/codex-rs/tui/src/app/test_support.rs b/codex-rs/tui/src/app/test_support.rs
+index 8b5901c..39795bb 100644
+--- a/codex-rs/tui/src/app/test_support.rs
++++ b/codex-rs/tui/src/app/test_support.rs
+@@ -49,6 +49,7 @@ pub(crate) async fn make_test_app() -> App {
+         retained_analytics: None,
+         deferred_history_lines: Vec::new(),
+         has_emitted_history_lines: false,
++        last_history_activity: None,
+         transcript_reflow: TranscriptReflowState::default(),
+         initial_history_replay_buffer: None,
+         pending_thread_switch_resets: 0,
+diff --git a/codex-rs/tui/src/app/tests.rs b/codex-rs/tui/src/app/tests.rs
+index 73bc892..3ac1814 100644
+--- a/codex-rs/tui/src/app/tests.rs
++++ b/codex-rs/tui/src/app/tests.rs
+@@ -6159,6 +6159,7 @@ async fn make_test_app() -> Box<App> {
+         retained_analytics: None,
+         deferred_history_lines: Vec::new(),
+         has_emitted_history_lines: false,
++        last_history_activity: None,
+         transcript_reflow: TranscriptReflowState::default(),
+         initial_history_replay_buffer: None,
+         pending_thread_switch_resets: 0,
+@@ -6279,6 +6280,7 @@ pub(super) async fn make_test_app_with_channels() -> (
+             retained_analytics: None,
+             deferred_history_lines: Vec::new(),
+             has_emitted_history_lines: false,
++            last_history_activity: None,
+             transcript_reflow: TranscriptReflowState::default(),
+             initial_history_replay_buffer: None,
+             pending_thread_switch_resets: 0,
 diff --git a/codex-rs/tui/src/app_backtrack.rs b/codex-rs/tui/src/app_backtrack.rs
 index f55b75c..d1b6514 100644
 --- a/codex-rs/tui/src/app_backtrack.rs
@@ -1495,10 +1654,10 @@ index 4c6ede3..0b1b7b8 100644
      TurnTipReady {
          thread_id: ThreadId,
 diff --git a/codex-rs/tui/src/chatwidget/activity_groups.rs b/codex-rs/tui/src/chatwidget/activity_groups.rs
-index 232d6c0..c141ffe 100644
+index 232d6c0..e4d90ba 100644
 --- a/codex-rs/tui/src/chatwidget/activity_groups.rs
 +++ b/codex-rs/tui/src/chatwidget/activity_groups.rs
-@@ -4,6 +4,72 @@
+@@ -4,6 +4,75 @@
  use super::*;
  
  impl ChatWidget {
@@ -1559,7 +1718,10 @@ index 232d6c0..c141ffe 100644
 +            } else {
 +                let active_lines =
 +                    active.display_hyperlink_lines_for_mode(width, self.history_render_mode());
-+                if !lines.is_empty() && !active_lines.is_empty() {
++                if !lines.is_empty()
++                    && !active_lines.is_empty()
++                    && active.activity_row_kind() != Some(history_cell::ActivityRowKind::Skill)
++                {
 +                    lines.push(HyperlinkLine::from(""));
 +                }
 +                lines.extend(active_lines);
@@ -1572,13 +1734,17 @@ index 232d6c0..c141ffe 100644
          &mut self,
          cell: Box<dyn HistoryCell>,
 diff --git a/codex-rs/tui/src/chatwidget/activity_presentation.rs b/codex-rs/tui/src/chatwidget/activity_presentation.rs
-index 573a477..6887f79 100644
+index 573a477..12cc647 100644
 --- a/codex-rs/tui/src/chatwidget/activity_presentation.rs
 +++ b/codex-rs/tui/src/chatwidget/activity_presentation.rs
-@@ -5,6 +5,14 @@ use super::*;
+@@ -5,6 +5,18 @@ use super::*;
  use crate::transcript_view::ActivityTranscriptLines;
  
  impl ChatWidget {
++    pub(crate) fn active_activity_row_kind(&self) -> Option<history_cell::ActivityRowKind> {
++        self.transcript.active_cell.as_deref()?.activity_row_kind()
++    }
++
 +    pub(crate) fn active_activity_summary(&self) -> Option<history_cell::ActivitySummary> {
 +        if self.history_render_mode() == HistoryRenderMode::Rich {
 +            self.transcript.active_cell.as_deref()?.activity_summary()
@@ -1590,7 +1756,7 @@ index 573a477..6887f79 100644
      pub(crate) fn active_activity_ids(&self) -> Vec<String> {
          self.transcript
              .active_cell
-@@ -17,9 +25,11 @@ impl ChatWidget {
+@@ -17,9 +29,11 @@ impl ChatWidget {
          &self,
          width: u16,
          expanded: bool,
@@ -1602,9 +1768,14 @@ index 573a477..6887f79 100644
          let render_compact = |cell: &dyn HistoryCell, width| {
              if cell.as_any().is::<history_cell::SessionInfoCell>() {
                  history_cell::fullscreen_session_lines(cell, width, /*detailed*/ false, mode)
-@@ -32,12 +42,31 @@ impl ChatWidget {
+@@ -30,14 +44,35 @@ impl ChatWidget {
+             }
+         };
          let has_activity = mode == HistoryRenderMode::Rich
-             && active.is_some_and(|cell| !cell.activity_ids().is_empty());
+-            && active.is_some_and(|cell| !cell.activity_ids().is_empty());
++            && active.is_some_and(|cell| {
++                !cell.activity_ids().is_empty() && cell.activity_disclosure(width).is_some()
++            });
          let activity = active.map_or_else(Vec::new, |cell| {
 -            if expanded && has_activity {
 +            if summary.is_some() && expanded {
@@ -1635,7 +1806,7 @@ index 573a477..6887f79 100644
          let disclosure = active
              .filter(|_| has_activity)
              .and_then(|cell| cell.activity_disclosure(width));
-@@ -50,15 +79,16 @@ impl ChatWidget {
+@@ -50,15 +85,16 @@ impl ChatWidget {
                  }
              })
              .unwrap_or_default();
@@ -1654,6 +1825,100 @@ index 573a477..6887f79 100644
              disclosure,
          })
      }
+diff --git a/codex-rs/tui/src/chatwidget/command_lifecycle.rs b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+index a0533b3..511313c 100644
+--- a/codex-rs/tui/src/chatwidget/command_lifecycle.rs
++++ b/codex-rs/tui/src/chatwidget/command_lifecycle.rs
+@@ -25,12 +25,17 @@ impl ChatWidget {
+             process_id,
+             source,
+             command_actions,
++            cwd,
+             ..
+         } = &item
+         else {
+             return;
+         };
+-        let (_command, parsed_cmd) = command_execution_command_and_parsed(command, command_actions);
++        let (_command, parsed_cmd) = command_execution_command_and_parsed(
++            command,
++            command_actions,
++            std::path::Path::new(cwd.as_str()),
++        );
+         self.flush_answer_stream_with_separator();
+         if is_unified_exec_source(*source) {
+             if *source == ExecCommandSource::UnifiedExecStartup {
+@@ -246,13 +251,17 @@ impl ChatWidget {
+             command,
+             source,
+             command_actions,
++            cwd,
+             ..
+         } = item
+         else {
+             return;
+         };
+-        let (command, parsed_cmd) =
+-            command_execution_command_and_parsed(&command, &command_actions);
++        let (command, parsed_cmd) = command_execution_command_and_parsed(
++            &command,
++            &command_actions,
++            std::path::Path::new(cwd.as_str()),
++        );
+         // Ensure the status indicator is visible while the command runs.
+         self.bottom_pane.ensure_status_indicator();
+         let parsed_cmd = self.annotate_skill_reads_in_parsed_cmd(parsed_cmd);
+@@ -337,6 +346,7 @@ impl ChatWidget {
+             source,
+             status,
+             command_actions,
++            cwd,
+             aggregated_output,
+             exit_code,
+             duration_ms,
+@@ -346,10 +356,14 @@ impl ChatWidget {
+             return;
+         };
+         let event_command = split_command_string(&command);
+-        let event_parsed = command_actions
++        let mut event_parsed = command_actions
+             .into_iter()
+             .map(codex_app_server_protocol::CommandAction::into_core)
+-            .collect();
++            .collect::<Vec<_>>();
++        crate::exec_command::resolve_read_paths(
++            &mut event_parsed,
++            std::path::Path::new(cwd.as_str()),
++        );
+         let duration = Duration::from_millis(duration_ms.unwrap_or_default().max(0) as u64);
+         let exit_code = if status == codex_app_server_protocol::CommandExecutionStatus::Completed {
+             exit_code.unwrap_or_default()
+diff --git a/codex-rs/tui/src/chatwidget/exec_state.rs b/codex-rs/tui/src/chatwidget/exec_state.rs
+index c8bb698..f1bb28e 100644
+--- a/codex-rs/tui/src/chatwidget/exec_state.rs
++++ b/codex-rs/tui/src/chatwidget/exec_state.rs
+@@ -71,13 +71,13 @@ pub(super) fn is_standard_tool_call(parsed_cmd: &[ParsedCommand]) -> bool {
+ pub(super) fn command_execution_command_and_parsed(
+     command: &str,
+     command_actions: &[codex_app_server_protocol::CommandAction],
++    cwd: &std::path::Path,
+ ) -> (Vec<String>, Vec<ParsedCommand>) {
+-    (
+-        split_command_string(command),
+-        command_actions
+-            .iter()
+-            .cloned()
+-            .map(codex_app_server_protocol::CommandAction::into_core)
+-            .collect(),
+-    )
++    let mut parsed = command_actions
++        .iter()
++        .cloned()
++        .map(codex_app_server_protocol::CommandAction::into_core)
++        .collect::<Vec<_>>();
++    crate::exec_command::resolve_read_paths(&mut parsed, cwd);
++    (split_command_string(command), parsed)
+ }
 diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
 index 85ea551..b07502c 100644
 --- a/codex-rs/tui/src/chatwidget/protocol.rs
@@ -2096,7 +2361,7 @@ index f8fe1bb..7d9fd34 100644
          } else if call.is_unified_exec_interaction() {
              "Background output".to_owned()
 diff --git a/codex-rs/tui/src/exec_cell/model.rs b/codex-rs/tui/src/exec_cell/model.rs
-index a99ea49..4e450a1 100644
+index a99ea49..e41ff86 100644
 --- a/codex-rs/tui/src/exec_cell/model.rs
 +++ b/codex-rs/tui/src/exec_cell/model.rs
 @@ -231,7 +231,7 @@ impl ExecCell {
@@ -2108,26 +2373,38 @@ index a99ea49..4e450a1 100644
              && !call.parsed.is_empty()
              && call.parsed.iter().all(|p| {
                  matches!(
-@@ -245,6 +245,13 @@ impl ExecCell {
+@@ -245,6 +245,17 @@ impl ExecCell {
  }
  
  impl ExecCall {
-+    pub(crate) fn is_activity_boundary(&self) -> bool {
-+        self.is_user_shell_command()
-+            || self.parsed.iter().any(|parsed| {
++    pub(crate) fn is_skill_read(&self) -> bool {
++        !self.is_user_shell_command()
++            && self.parsed.iter().any(|parsed| {
 +                matches!(parsed, ParsedCommand::Read { name, .. } if name == "SKILL.md" || name.starts_with("SKILL.md ("))
 +            })
++    }
++
++    pub(crate) fn is_activity_boundary(&self) -> bool {
++        self.is_user_shell_command() || self.is_skill_read()
 +    }
 +
      pub(crate) fn is_user_shell_command(&self) -> bool {
          matches!(self.source, ExecCommandSource::UserShell)
      }
 diff --git a/codex-rs/tui/src/exec_cell/render.rs b/codex-rs/tui/src/exec_cell/render.rs
-index bae014e..1e3ebab 100644
+index bae014e..8ddf8c7 100644
 --- a/codex-rs/tui/src/exec_cell/render.rs
 +++ b/codex-rs/tui/src/exec_cell/render.rs
-@@ -7,6 +7,8 @@ use super::model::ExecCall;
+@@ -1,12 +1,16 @@
+ //! Command previews and full transcripts, retaining logical text through display wrapping.
+ 
++use std::collections::HashSet;
+ use std::time::Instant;
+ 
+ use super::model::CommandOutput;
+ use super::model::ExecCall;
  use super::model::ExecCell;
++use crate::exec_command::relativize_to_home;
  use crate::exec_command::strip_bash_lc_and_escape;
  use crate::history_cell::ActivityDisclosure;
 +use crate::history_cell::ActivityKind;
@@ -2135,7 +2412,7 @@ index bae014e..1e3ebab 100644
  use crate::history_cell::HistoryCell;
  use crate::history_cell::HistoryRenderMode;
  use crate::history_cell::plain_lines;
-@@ -209,7 +211,60 @@ fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Spa
+@@ -209,7 +213,68 @@ fn activity_marker(start_time: Option<Instant>, animations_enabled: bool) -> Spa
      .unwrap_or_else(|| "•".dim())
  }
  
@@ -2150,6 +2427,14 @@ index bae014e..1e3ebab 100644
 +}
 +
  impl HistoryCell for ExecCell {
++    fn activity_row_kind(&self) -> Option<crate::history_cell::ActivityRowKind> {
++        Some(if self.group.calls.iter().any(ExecCall::is_skill_read) {
++            crate::history_cell::ActivityRowKind::Skill
++        } else {
++            crate::history_cell::ActivityRowKind::Tool
++        })
++    }
++
 +    fn activity_summary(&self) -> Option<ActivitySummary> {
 +        if self.group.calls.iter().any(ExecCall::is_activity_boundary) {
 +            return None;
@@ -2196,10 +2481,13 @@ index bae014e..1e3ebab 100644
      fn append_reasoning(&mut self, cell: Box<dyn HistoryCell>) -> Result<(), Box<dyn HistoryCell>> {
          if self.is_exploring_cell() {
              self.group.push_detail(std::sync::Arc::from(cell));
-@@ -220,6 +275,11 @@ impl HistoryCell for ExecCell {
+@@ -220,6 +285,14 @@ impl HistoryCell for ExecCell {
      }
  
      fn activity_disclosure(&self, width: u16) -> Option<ActivityDisclosure> {
++        if self.group.calls.iter().any(ExecCall::is_skill_read) {
++            return None;
++        }
 +        // Agent rows collapse to one line, so any visible row can expand to its full output.
 +        if !self.group.calls.iter().any(ExecCall::is_user_shell_command) {
 +            return (!self.display_hyperlink_lines(width).is_empty())
@@ -2208,7 +2496,7 @@ index bae014e..1e3ebab 100644
          if self.is_exploring_cell() {
              return Some(ActivityDisclosure::Generic);
          }
-@@ -235,48 +295,55 @@ impl HistoryCell for ExecCell {
+@@ -235,48 +308,60 @@ impl HistoryCell for ExecCell {
      }
  
      fn compact_hyperlink_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -2259,12 +2547,17 @@ index bae014e..1e3ebab 100644
 +            return self.full_display_hyperlink_lines(width);
 +        }
 +        let mut lines = Vec::new();
++        let mut paths = HashSet::new();
 +        for call in &self.group.calls {
 +            for parsed in &call.parsed {
-+                if let ParsedCommand::Read { name, .. } = parsed
++                if let ParsedCommand::Read { name, path, .. } = parsed
 +                    && (name == "SKILL.md" || name.starts_with("SKILL.md ("))
++                    && paths.insert(path)
 +                {
-+                    let line = Line::from(vec!["• ".dim(), "Read ".cyan(), name.clone().into()]);
++                    let display = relativize_to_home(path)
++                        .map(|relative| format!("~/{}", relative.display()))
++                        .unwrap_or_else(|| path.display().to_string());
++                    let line = Line::from(vec!["• ".dim(), "Read ".cyan(), display.into()]);
 +                    let wrapped = crate::wrapping::adaptive_wrap_line(
 +                        &line,
 +                        RtOptions::new(usize::from(width.max(1))),
@@ -2272,10 +2565,10 @@ index bae014e..1e3ebab 100644
 +                    crate::render::line_utils::push_owned_lines(&wrapped, &mut lines);
 +                }
 +            }
-+        }
+         }
 +        if !lines.is_empty() {
 +            return plain_hyperlink_lines(lines);
-         }
++        }
 +        if self
 +            .group
 +            .calls
@@ -2298,7 +2591,7 @@ index bae014e..1e3ebab 100644
      }
  
      fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
-@@ -293,6 +360,45 @@ impl HistoryCell for ExecCell {
+@@ -293,6 +378,45 @@ impl HistoryCell for ExecCell {
              .collect()
      }
  
@@ -2344,7 +2637,7 @@ index bae014e..1e3ebab 100644
      fn raw_lines(&self) -> Vec<Line<'static>> {
          plain_lines(visible_lines(
              self.detailed_hyperlink_lines(u16::MAX, HistoryRenderMode::Raw),
-@@ -311,6 +417,14 @@ impl ExecCell {
+@@ -311,6 +435,14 @@ impl ExecCell {
      }
  
      fn exploring_display_lines(&self, width: u16) -> Vec<HyperlinkLine> {
@@ -2359,7 +2652,7 @@ index bae014e..1e3ebab 100644
          let mut out: Vec<HyperlinkLine> = Vec::new();
          out.push(
              Line::from(vec![
-@@ -329,7 +443,7 @@ impl ExecCell {
+@@ -329,7 +461,7 @@ impl ExecCell {
              .into(),
          );
  
@@ -2368,7 +2661,7 @@ index bae014e..1e3ebab 100644
          let mut out_indented = Vec::new();
          let nonzero_exit = |call: &ExecCall| {
              call.duration
-@@ -1359,4 +1473,154 @@ mod tests {
+@@ -1359,4 +1491,161 @@ mod tests {
              "expected the complete URL, got: {rendered:?}"
          );
      }
@@ -2401,7 +2694,7 @@ index bae014e..1e3ebab 100644
 +            vec![ParsedCommand::Read {
 +                cmd: "cat SKILL.md".into(),
 +                name: "SKILL.md (pr:sweep skill)".into(),
-+                path: "SKILL.md".into(),
++                path: "/skills/sweep/SKILL.md".into(),
 +            }],
 +            ExecCommandSource::Agent,
 +            /*interaction_input*/ None,
@@ -2412,9 +2705,16 @@ index bae014e..1e3ebab 100644
 +            CommandOutput::new(/*exit_code*/ 0, "skill body".into()),
 +            std::time::Duration::ZERO,
 +        );
++        assert!(cell.activity_disclosure(/*width*/ 80).is_none());
++        let transcript = cell
++            .transcript_lines(80)
++            .iter()
++            .map(render_line_text)
++            .join("\n");
++        assert!(transcript.contains("$ cat SKILL.md\nskill body"));
 +        let visible = cell.display_lines_for_mode(/*width*/ 80, HistoryRenderMode::Rich);
 +        insta::assert_snapshot!(visible.iter().map(render_line_text).join("
-+"), @"• Read SKILL.md (pr:sweep skill)");
++"), @"• Read /skills/sweep/SKILL.md");
 +        assert_eq!(
 +            visible_lines(cell.compact_hyperlink_lines(/*width*/ 80)),
 +            visible
@@ -2633,15 +2933,56 @@ index 43ed4ce..a26ec95 100644
          lines
      }
  }
+diff --git a/codex-rs/tui/src/exec_command.rs b/codex-rs/tui/src/exec_command.rs
+index 0083e1d..286b8df 100644
+--- a/codex-rs/tui/src/exec_command.rs
++++ b/codex-rs/tui/src/exec_command.rs
+@@ -1,7 +1,9 @@
+ use std::path::Path;
+ use std::path::PathBuf;
+ 
++use codex_protocol::parse_command::ParsedCommand;
+ use codex_shell_command::parse_command::extract_shell_command;
++use codex_utils_absolute_path::AbsolutePathBuf;
+ use dirs::home_dir;
+ use shlex::try_join;
+ 
+@@ -32,6 +34,14 @@ pub(crate) fn split_command_string(command: &str) -> Vec<String> {
+     }
+ }
+ 
++pub(crate) fn resolve_read_paths(parsed: &mut [ParsedCommand], cwd: &Path) {
++    for command in parsed {
++        if let ParsedCommand::Read { path, .. } = command {
++            *path = AbsolutePathBuf::resolve_path_against_base(&*path, cwd).into_path_buf();
++        }
++    }
++}
++
+ /// If `path` is absolute and inside $HOME, return the part *after* the home
+ /// directory; otherwise, return the path as-is. Note if `path` is the homedir,
+ /// this will return and empty path.
 diff --git a/codex-rs/tui/src/history_cell/activity_summary.rs b/codex-rs/tui/src/history_cell/activity_summary.rs
 new file mode 100644
-index 0000000..570c653
+index 0000000..f63c723
 --- /dev/null
 +++ b/codex-rs/tui/src/history_cell/activity_summary.rs
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,94 @@
 +//! Counts finished calls without changing their retained transcript cells.
 +
 +use super::*;
++
++#[derive(Clone, Copy, PartialEq, Eq)]
++pub(crate) enum ActivityRowKind {
++    Tool,
++    Skill,
++}
++
++impl ActivityRowKind {
++    pub(crate) fn stacks_with(self, previous: Option<Self>) -> bool {
++        previous.is_some_and(|previous| self == Self::Skill || previous == Self::Skill)
++    }
++}
 +
 +#[derive(Clone, Copy, Debug)]
 +pub(crate) enum ActivityKind {
@@ -2714,7 +3055,7 @@ index 0000000..570c653
 +        if prefix.is_empty() {
 +            return lines;
 +        }
-+        if !lines.is_empty() {
++        if !lines.is_empty() && cell.activity_row_kind() != Some(ActivityRowKind::Skill) {
 +            prefix.push(HyperlinkLine::from(""));
 +        }
 +        prefix.extend(lines);
@@ -2852,27 +3193,33 @@ index 9f80e5e..26a960e 100644
          vec![format!("mcp:{}", self.call_id)]
      }
 diff --git a/codex-rs/tui/src/history_cell/mod.rs b/codex-rs/tui/src/history_cell/mod.rs
-index ac39aef..6e69317 100644
+index ac39aef..0d6000c 100644
 --- a/codex-rs/tui/src/history_cell/mod.rs
 +++ b/codex-rs/tui/src/history_cell/mod.rs
-@@ -10,6 +10,10 @@
+@@ -10,6 +10,11 @@
  //! bumps the active-cell revision tracked by `ChatWidget`, so the cache key changes whenever the
  //! rendered transcript output can change.
  
 +mod activity_summary;
 +pub(crate) use activity_summary::ActivityKind;
++pub(crate) use activity_summary::ActivityRowKind;
 +pub(crate) use activity_summary::ActivitySummary;
 +
  mod activity_group;
  pub(crate) use activity_group::ActivityGroup;
  
-@@ -218,6 +222,15 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
+@@ -218,6 +223,20 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
          None
      }
  
 +    /// Finished calls eligible for the compact activity run. Ordinary visible cells end it.
 +    fn activity_summary(&self) -> Option<ActivitySummary> {
 +        None
++    }
++
++    fn activity_row_kind(&self) -> Option<ActivityRowKind> {
++        (self.activity_summary().is_some() || !self.activity_ids().is_empty())
++            .then_some(ActivityRowKind::Tool)
 +    }
 +
 +    fn running_activity_lines(&self, _width: u16) -> Vec<HyperlinkLine> {
@@ -2882,7 +3229,7 @@ index ac39aef..6e69317 100644
      /// Returns the logical lines for the main chat viewport.
      fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
  
-@@ -255,6 +268,26 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
+@@ -255,6 +274,26 @@ pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
          Vec::new()
      }
  
@@ -3560,8 +3907,86 @@ index 2a9d327..0396906 100644
 +    assert!(!rendered.contains("commands"));
 +    assert_eq!(rendered.matches("added line").count(), 2);
 +}
+diff --git a/codex-rs/tui/src/thread_transcript/tools.rs b/codex-rs/tui/src/thread_transcript/tools.rs
+index 73e80d6..7e01cc8 100644
+--- a/codex-rs/tui/src/thread_transcript/tools.rs
++++ b/codex-rs/tui/src/thread_transcript/tools.rs
+@@ -135,6 +135,7 @@ impl CommandHistory {
+             source,
+             status,
+             command_actions,
++            cwd,
+             aggregated_output,
+             exit_code,
+             duration_ms,
+@@ -154,13 +155,15 @@ impl CommandHistory {
+                 exit_code.filter(|code| *code != 0).unwrap_or(/*default*/ 1)
+             }
+         };
++        let mut parsed = command_actions
++            .into_iter()
++            .map(codex_app_server_protocol::CommandAction::into_core)
++            .collect::<Vec<_>>();
++        crate::exec_command::resolve_read_paths(&mut parsed, std::path::Path::new(cwd.as_str()));
+         Some(Self {
+             id,
+             command: replay_command_args(&command)?,
+-            parsed: command_actions
+-                .into_iter()
+-                .map(codex_app_server_protocol::CommandAction::into_core)
+-                .collect(),
++            parsed,
+             source,
+             aggregated_output: aggregated_output.unwrap_or_default(),
+             exit_code,
+diff --git a/codex-rs/tui/src/thread_transcript/tools_tests.rs b/codex-rs/tui/src/thread_transcript/tools_tests.rs
+index 267168c..a4f2d9c 100644
+--- a/codex-rs/tui/src/thread_transcript/tools_tests.rs
++++ b/codex-rs/tui/src/thread_transcript/tools_tests.rs
+@@ -35,6 +35,41 @@ fn command_item(status: CommandExecutionStatus) -> ThreadItem {
+     }
+ }
+ 
++#[test]
++fn compact_main_view_skill_paths_resolve_against_call_cwd() {
++    let mut item = command_item(CommandExecutionStatus::Completed);
++    if let ThreadItem::CommandExecution {
++        command,
++        cwd,
++        command_actions,
++        ..
++    } = &mut item
++    {
++        *command = "cat ./demo/SKILL.md".into();
++        *cwd = LegacyAppPathString::from_string("/opt/skills");
++        *command_actions = vec![CommandAction::Read {
++            command: "cat ./demo/SKILL.md".into(),
++            name: "SKILL.md".into(),
++            path: LegacyAppPathString::from_string("./demo/SKILL.md"),
++        }];
++    }
++    let cells = thread_items_to_transcript_cells(
++        None,
++        &test_path_buf("/other/workspace").abs(),
++        [item],
++        RawReasoningVisibility::Hidden,
++        None,
++    );
++    assert_eq!(
++        cells[0]
++            .display_lines(80)
++            .iter()
++            .map(ToString::to_string)
++            .collect::<Vec<_>>(),
++        ["• Read /opt/skills/demo/SKILL.md"]
++    );
++}
++
+ fn mcp_item(server: &str, id: &str) -> ThreadItem {
+     ThreadItem::McpToolCall {
+         id: id.to_string(),
 diff --git a/codex-rs/tui/src/transcript_view.rs b/codex-rs/tui/src/transcript_view.rs
-index 31ebfec..9648931 100644
+index 31ebfec..6401771 100644
 --- a/codex-rs/tui/src/transcript_view.rs
 +++ b/codex-rs/tui/src/transcript_view.rs
 @@ -6,6 +6,7 @@
@@ -3580,12 +4005,13 @@ index 31ebfec..9648931 100644
  pub(crate) use bookmark::TranscriptBookmark;
  pub(crate) use input::JumpTarget;
  pub(crate) use input::ViewAction;
-@@ -96,11 +98,15 @@ pub(crate) struct TranscriptView {
+@@ -96,11 +98,16 @@ pub(crate) struct TranscriptView {
      composer_tip: Option<(Rect, HyperlinkLine)>,
      turn_tip_key: Option<EntryKey>,
      cache: LayoutCache,
 +    activity_runs: activity_runs::ActivityRuns,
 +    live_activity: Option<crate::history_cell::ActivitySummary>,
++    live_activity_kind: Option<crate::history_cell::ActivityRowKind>,
 +    live_run_summary: Option<crate::history_cell::ActivitySummary>,
      live: Option<Arc<TextLayout>>,
      live_separated: Option<Arc<TextLayout>>,
@@ -3596,7 +4022,7 @@ index 31ebfec..9648931 100644
      suppressed_prompt_header: Option<prompt_header::SuppressedHeader>,
      visible: Vec<VisibleRow>,
      selection: Option<Selection>,
-@@ -117,6 +123,7 @@ pub(crate) struct TranscriptView {
+@@ -117,6 +124,7 @@ pub(crate) struct TranscriptView {
      last_tail: Option<EntryKey>,
      last_click: Option<(std::time::Instant, u16, u16, u8)>,
      disclosure: disclosure::Disclosure,
@@ -3604,12 +4030,13 @@ index 31ebfec..9648931 100644
  }
  
  impl Default for TranscriptView {
-@@ -132,11 +139,15 @@ impl Default for TranscriptView {
+@@ -132,11 +140,16 @@ impl Default for TranscriptView {
              composer_tip: None,
              turn_tip_key: None,
              cache: LayoutCache::default(),
 +            activity_runs: activity_runs::ActivityRuns::default(),
 +            live_activity: None,
++            live_activity_kind: None,
 +            live_run_summary: None,
              live: None,
              live_separated: None,
@@ -3620,7 +4047,7 @@ index 31ebfec..9648931 100644
              suppressed_prompt_header: None,
              visible: Vec::new(),
              selection: None,
-@@ -153,6 +164,7 @@ impl Default for TranscriptView {
+@@ -153,6 +166,7 @@ impl Default for TranscriptView {
              last_tail: None,
              last_click: None,
              disclosure: disclosure::Disclosure::default(),
@@ -3628,7 +4055,7 @@ index 31ebfec..9648931 100644
          }
      }
  }
-@@ -173,6 +185,7 @@ impl TranscriptView {
+@@ -173,6 +187,7 @@ impl TranscriptView {
  
      pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, cells: &[Arc<dyn HistoryCell>]) {
          self.composer_tip = None;
@@ -3636,7 +4063,7 @@ index 31ebfec..9648931 100644
          self.cache.begin_frame();
          self.sync_history_tail(cells);
          let current_cells = cells;
-@@ -217,8 +230,18 @@ impl TranscriptView {
+@@ -217,8 +232,18 @@ impl TranscriptView {
              }
              // Following may advance into the next turn after reserving the header row.
              start = self.start(cells);
@@ -3657,7 +4084,7 @@ index 31ebfec..9648931 100644
              } else {
                  body = area;
                  self.area = area;
-@@ -259,6 +282,9 @@ impl TranscriptView {
+@@ -259,6 +284,9 @@ impl TranscriptView {
              };
              let row_area = Rect::new(area.x, y, area.width, /*height*/ 1);
              layout.render(row_area, buf, row);
@@ -3667,7 +4094,7 @@ index 31ebfec..9648931 100644
              self.render_disclosure(&activity_ids, &layout, row, row_area, buf);
              if self.highlight == Some(index) && self.selection.is_none() && !self.search.is_active()
              {
-@@ -305,17 +331,53 @@ impl TranscriptView {
+@@ -305,17 +333,53 @@ impl TranscriptView {
  
      pub(crate) fn sync_live_activity_tail(
          &mut self,
@@ -3723,7 +4150,7 @@ index 31ebfec..9648931 100644
          })
      }
  
-@@ -373,6 +435,12 @@ impl TranscriptView {
+@@ -373,6 +437,12 @@ impl TranscriptView {
          self.selection.is_some() || self.search.is_active() || self.is_activity_focused()
      }
  
@@ -3736,7 +4163,7 @@ index 31ebfec..9648931 100644
      pub(crate) fn is_detailed(&self) -> bool {
          self.detailed
      }
-@@ -645,7 +713,7 @@ impl TranscriptView {
+@@ -645,7 +715,7 @@ impl TranscriptView {
  
  #[cfg(test)]
  #[path = "transcript_view_tests.rs"]
@@ -3747,10 +4174,10 @@ index 31ebfec..9648931 100644
  #[path = "transcript_view/markdown_copy_tests.rs"]
 diff --git a/codex-rs/tui/src/transcript_view/activity_runs.rs b/codex-rs/tui/src/transcript_view/activity_runs.rs
 new file mode 100644
-index 0000000..0ba8a64
+index 0000000..672f4db
 --- /dev/null
 +++ b/codex-rs/tui/src/transcript_view/activity_runs.rs
-@@ -0,0 +1,180 @@
+@@ -0,0 +1,190 @@
 +//! Project compact runs onto their first visible member while retaining per-cell identities.
 +
 +use crate::history_cell::ActivitySummary;
@@ -3775,6 +4202,16 @@ index 0000000..0ba8a64
 +}
 +
 +impl TranscriptView {
++    pub(crate) fn sync_live_activity_row_kind(
++        &mut self,
++        kind: Option<crate::history_cell::ActivityRowKind>,
++    ) {
++        if self.live_activity_kind != kind {
++            self.live_activity_kind = kind;
++            self.live_separated = None;
++        }
++    }
++
 +    pub(super) fn groups_activity(&self) -> bool {
 +        !self.detailed && self.mode == HistoryRenderMode::Rich && !self.file_edits_only
 +    }
@@ -4415,7 +4852,7 @@ index ced88a7..0d03202 100644
              && event
                  .modifiers
 diff --git a/codex-rs/tui/src/transcript_view/layout.rs b/codex-rs/tui/src/transcript_view/layout.rs
-index 5e912a0..1fc1130 100644
+index 5e912a0..a9d7976 100644
 --- a/codex-rs/tui/src/transcript_view/layout.rs
 +++ b/codex-rs/tui/src/transcript_view/layout.rs
 @@ -10,7 +10,8 @@ use std::sync::Weak;
@@ -4436,6 +4873,15 @@ index 5e912a0..1fc1130 100644
  }
  
  /// Keep disclosure controls outside selectable source without rendering hidden details.
+@@ -27,7 +29,7 @@ pub(super) fn activity_layout(
+     expanded: bool,
+     shortcut: Option<ShortcutHint>,
+ ) -> TextLayout {
+-    let has_details = !lines.activity.is_empty() && (expanded || lines.disclosure.is_some());
++    let has_details = !lines.activity.is_empty() && lines.disclosure.is_some();
+     let source_offset = (!lines.auxiliary.is_empty())
+         .then(|| TextLayout::new(lines.activity.clone(), width).text().len());
+     lines.activity.extend(lines.auxiliary);
 @@ -35,6 +37,12 @@ pub(super) fn activity_layout(
      if !has_details {
          return layout;
@@ -4471,7 +4917,7 @@ index 5e912a0..1fc1130 100644
  }
  
  impl TranscriptView {
-@@ -143,12 +156,19 @@ impl TranscriptView {
+@@ -143,12 +156,24 @@ impl TranscriptView {
          index: usize,
          full_content: bool,
      ) -> Option<Arc<TextLayout>> {
@@ -4489,11 +4935,16 @@ index 5e912a0..1fc1130 100644
 +                && self
 +                    .compact_activity_run(cells, index)
 +                    .is_some_and(|run| run.head.is_some_and(|head| head < index));
-+            if cells.is_empty() || self.live_continuation || joined_run {
++            let stacked = !full_content
++                && self.mode == HistoryRenderMode::Rich
++                && self.live_activity_kind.is_some_and(|kind| {
++                    kind.stacks_with(previous_activity_kind(cells, index, self.area.width.max(1)))
++                });
++            if cells.is_empty() || self.live_continuation || joined_run || stacked {
                  return Some(Arc::clone(live));
              }
              let width = self.area.width.max(/*other*/ 1);
-@@ -157,6 +177,9 @@ impl TranscriptView {
+@@ -157,6 +182,9 @@ impl TranscriptView {
              })));
          };
          let width = self.area.width.max(/*other*/ 1);
@@ -4503,7 +4954,7 @@ index 5e912a0..1fc1130 100644
          // Session information belongs before all history, including pages not loaded yet.
          // Pinned displayed revisions above remain visible; hidden headers never enter the cache.
          if self.history.has_unloaded_history()
-@@ -165,27 +188,89 @@ impl TranscriptView {
+@@ -165,27 +193,96 @@ impl TranscriptView {
              return Some(Arc::new(TextLayout::new(Vec::new(), width)));
          }
          let mode = self.mode;
@@ -4518,8 +4969,9 @@ index 5e912a0..1fc1130 100644
 +            .filter(|run| run.head == Some(index))
 +            .map(|run| run.summary);
 +        let cell_ids = cell.activity_ids();
-+        let disclosure =
-+            !self.detailed && mode == HistoryRenderMode::Rich && (!cell_ids.is_empty() || grouped);
++        let disclosure = !self.detailed
++            && mode == HistoryRenderMode::Rich
++            && (grouped || (!cell_ids.is_empty() && cell.activity_disclosure(width).is_some()));
 +        let manually_expanded = run.map_or_else(
 +            || self.disclosure.is_expanded(&cell_ids),
 +            |run| run.expanded,
@@ -4527,7 +4979,13 @@ index 5e912a0..1fc1130 100644
          let expanded = disclosure && (full_content || manually_expanded);
 -        if manually_expanded {
 -            self.disclosure.expanded.extend(ids);
++        let stacked = !full_content
++            && mode == HistoryRenderMode::Rich
++            && cell
++                .activity_row_kind()
++                .is_some_and(|kind| kind.stacks_with(previous_activity_kind(cells, index, width)));
 +        let separated = index > 0
++            && !stacked
 +            && !cell.is_stream_continuation()
 +            && run.is_none_or(|run| run.head == Some(index));
 +        let run_id = run.map(|run| run.id.clone());
@@ -4600,7 +5058,7 @@ index 5e912a0..1fc1130 100644
                  activity_layout(
                      ActivityTranscriptLines {
                          activity: if expanded {
-@@ -194,6 +279,7 @@ impl TranscriptView {
+@@ -194,6 +291,7 @@ impl TranscriptView {
                              cell.compact_hyperlink_lines(width)
                          },
                          auxiliary: Vec::new(),
@@ -4608,9 +5066,38 @@ index 5e912a0..1fc1130 100644
                          disclosure: cell.activity_disclosure(width),
                      },
                      width,
-@@ -216,6 +302,10 @@ impl TranscriptView {
+@@ -215,7 +313,39 @@ impl TranscriptView {
+     }
  }
  
++fn previous_activity_kind(
++    cells: &[Arc<dyn HistoryCell>],
++    index: usize,
++    width: u16,
++) -> Option<crate::history_cell::ActivityRowKind> {
++    cells[..index]
++        .iter()
++        .rev()
++        .find_map(|cell| {
++            if cell
++                .as_any()
++                .is::<crate::history_cell::FinalMessageSeparator>()
++            {
++                return Some(None);
++            }
++            let visible = cell.activity_summary().map_or_else(
++                || !cell.display_hyperlink_lines(width).is_empty(),
++                |summary| !summary.is_empty() || !cell.running_activity_lines(width).is_empty(),
++            );
++            if visible {
++                Some(cell.activity_row_kind())
++            } else {
++                None
++            }
++        })
++        .flatten()
++}
++
  impl LayoutCache {
 +    pub(super) fn frame(&self) -> u64 {
 +        self.frame
@@ -4619,7 +5106,7 @@ index 5e912a0..1fc1130 100644
      pub(super) fn begin_frame(&mut self) {
          self.frame = self.frame.wrapping_add(/*rhs*/ 1);
          let state = RenderState {
-@@ -244,7 +334,8 @@ impl LayoutCache {
+@@ -244,7 +374,8 @@ impl LayoutCache {
                  && entry.presentation == presentation
                  && entry.source.ptr_eq(&source)
                  && (entry.rendered_frame == self.frame
@@ -4629,7 +5116,7 @@ index 5e912a0..1fc1130 100644
                          && entry.animation_tick == animation_tick))
          }) {
              let layout = Arc::clone(&self.entries[index].layout);
-@@ -273,6 +364,7 @@ impl LayoutCache {
+@@ -273,6 +404,7 @@ impl LayoutCache {
              layout: Arc::clone(&layout),
              rendered_frame: self.frame,
              animation_tick,
@@ -4638,7 +5125,7 @@ index 5e912a0..1fc1130 100644
          self.evict();
          layout
 diff --git a/codex-rs/tui/src/transcript_view/layout_tests.rs b/codex-rs/tui/src/transcript_view/layout_tests.rs
-index 486adc4..e742f54 100644
+index 486adc4..b7aed32 100644
 --- a/codex-rs/tui/src/transcript_view/layout_tests.rs
 +++ b/codex-rs/tui/src/transcript_view/layout_tests.rs
 @@ -51,6 +51,10 @@ fn layouts_refresh_for_width_animation_and_mutable_frames() {
@@ -4693,7 +5180,7 @@ index 486adc4..e742f54 100644
              },
              || {
                  TextLayout::new(
-@@ -137,7 +150,587 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
+@@ -137,7 +150,692 @@ fn recent_entries_are_reused_and_old_entries_are_evicted() {
          );
      }
      assert_eq!(
@@ -4710,7 +5197,8 @@ index 486adc4..e742f54 100644
 +    finished: bool,
 +) -> crate::exec_cell::ExecCell {
 +    let command = vec!["bash".into(), "-lc".into(), command.into()];
-+    let parsed = codex_shell_command::parse_command::parse_command(&command);
++    let mut parsed = codex_shell_command::parse_command::parse_command(&command);
++    crate::exec_command::resolve_read_paths(&mut parsed, std::path::Path::new("/repo"));
 +    let mut cell =
 +        crate::exec_cell::new_active_exec_command(id.into(), command, parsed, source, None, false);
 +    if finished {
@@ -4774,7 +5262,9 @@ index 486adc4..e742f54 100644
 +#[test]
 +fn compact_main_view_fullscreen_skill_and_manual_commands_break_runs() {
 +    use crate::transcript_view::tests::{render, text};
-+    use codex_app_server_protocol::CommandExecutionSource::{Agent, UserShell};
++    use codex_app_server_protocol::CommandExecutionSource::{
++        Agent, UnifiedExecInteraction, UserShell,
++    };
 +    let cells: Vec<Arc<dyn HistoryCell>> = vec![
 +        Arc::new(crate::history_cell::new_user_prompt(
 +            "Run commands".into(),
@@ -4783,6 +5273,12 @@ index 486adc4..e742f54 100644
 +            vec![],
 +        )),
 +        Arc::new(compact_exec("skill-first", "cat SKILL.md", Agent, true)),
++        Arc::new(compact_exec(
++            "wait",
++            "sleep 1",
++            UnifiedExecInteraction,
++            true,
++        )),
 +        Arc::new(compact_exec("one", "echo one", Agent, true)),
 +        Arc::new(compact_exec("skill", "cat SKILL.md", Agent, true)),
 +        Arc::new(compact_exec("two", "echo two", Agent, true)),
@@ -4801,12 +5297,9 @@ index 486adc4..e742f54 100644
 +    › Run commands
 +
 +
-+    • Read SKILL.md
-+
++    • Read /repo/SKILL.md
 +    • 1 command
-+
-+    • Read SKILL.md
-+
++    • Read /repo/SKILL.md
 +    • 1 command
 +
 +    • You ran echo manual
@@ -4816,6 +5309,105 @@ index 486adc4..e742f54 100644
 +
 +    • 1 command
 +    ");
++}
++
++#[test]
++fn compact_main_view_skill_paths_deduplicate_reads() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    let home = dirs::home_dir().expect("home directory");
++    let command = format!(
++        "cat {}/.codex/skills/alpha/SKILL.md; sed -n '1,200p' /repo/beta/SKILL.md; sed -n '200,400p' /repo/beta/../beta/SKILL.md",
++        home.display()
++    );
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![
++        Arc::new(compact_exec("skills", &command, Agent, true)),
++        Arc::new(compact_exec(
++            "repeat",
++            "cat /repo/beta/SKILL.md",
++            Agent,
++            true,
++        )),
++    ];
++    let mut view = TranscriptView::default();
++    assert_eq!(
++        text(&render(&mut view, &cells, 100, 12)).trim_end(),
++        "• Read ~/.codex/skills/alpha/SKILL.md\n• Read /repo/beta/SKILL.md\n• Read /repo/beta/SKILL.md"
++    );
++    view.set_presentation(true, HistoryRenderMode::Rich);
++    let detailed = text(&render(&mut view, &cells, 200, 24));
++    assert!(detailed.contains("sed -n '200,400p'"), "{detailed}");
++    assert!(detailed.contains("retained output"), "{detailed}");
++}
++
++#[test]
++fn compact_main_view_skill_rows_ignore_mouse_and_keyboard_disclosure() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    let cells: Vec<Arc<dyn HistoryCell>> = vec![
++        Arc::new(compact_exec(
++            "skills",
++            "cat /repo/alpha/SKILL.md; cat /repo/beta/SKILL.md",
++            Agent,
++            true,
++        )),
++        Arc::new(compact_exec(
++            "later",
++            "cat /repo/alpha/SKILL.md",
++            Agent,
++            true,
++        )),
++    ];
++    let mut view = TranscriptView::default();
++    let before = text(&render(&mut view, &cells, 80, 12));
++    for row in 0..3 {
++        assert!(!view.toggle_disclosure_at(&cells, 4, row));
++        compact_click(&mut view, &cells, row);
++        assert_eq!(text(&render(&mut view, &cells, 80, 12)), before);
++    }
++    for code in [KeyCode::F(4), KeyCode::Enter, KeyCode::Right] {
++        view.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &cells);
++        assert!(!view.is_activity_focused());
++        assert_eq!(text(&render(&mut view, &cells, 80, 12)), before);
++    }
++    // Even retained expansion state must not reveal a skill row.
++    view.disclosure.expanded.insert("exec:skills".into());
++    view.cache.clear();
++    assert_eq!(text(&render(&mut view, &cells, 80, 12)), before);
++}
++
++#[test]
++fn compact_main_view_live_skill_rows_stack_without_disclosure() {
++    use crate::transcript_view::tests::{render, text};
++    use codex_app_server_protocol::CommandExecutionSource::Agent;
++    let cells: Vec<Arc<dyn HistoryCell>> =
++        vec![Arc::new(compact_exec("before", "pwd", Agent, true))];
++    let skill = compact_exec(
++        "skills",
++        "cat /repo/alpha/SKILL.md; cat /repo/beta/SKILL.md",
++        Agent,
++        false,
++    );
++    let mut view = TranscriptView::default();
++    view.sync_live_activity_summary(skill.activity_summary());
++    view.sync_live_activity_row_kind(skill.activity_row_kind());
++    view.sync_live_activity(&cells, skill.activity_ids());
++    view.sync_live_activity_tail(&cells, 80, None, true, |width, _| {
++        Some(ActivityTranscriptLines {
++            activity: skill.display_hyperlink_lines(width),
++            auxiliary: vec![],
++            members: vec![],
++            disclosure: skill.activity_disclosure(width),
++        })
++    });
++    assert_eq!(
++        text(&render(&mut view, &cells, 80, 12)).trim_end(),
++        "• 1 command\n• Read /repo/alpha/SKILL.md\n• Read /repo/beta/SKILL.md"
++    );
++    for row in 1..3 {
++        assert!(!view.toggle_disclosure_at(&cells, 4, row));
++    }
 +}
 +
 +#[test]
